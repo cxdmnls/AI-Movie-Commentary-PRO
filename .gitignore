@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 项目特定
+workspace/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.flv
+*.wmv
+
+# Logs
+*.log
+debug.txt
+nul
+
+# OS
+.DS_Store
+Thumbs.db

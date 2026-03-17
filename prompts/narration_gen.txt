@@ -1,0 +1,27 @@
+你是资深电影解说文案专家，请基于以下材料生成结构化解说片段。
+
+目标字数：{target_words}
+
+已筛选场景：
+{selected_scenes_json}
+
+字幕数据：
+{subtitles_json}
+
+电影信息：
+{movie_info_json}
+
+请仅输出 JSON，格式如下：
+{{
+  "segments": [
+    {{
+      "segment_id": 1,
+      "scene_ids": [1, 2],
+      "video_clip": {{"start": 0.0, "end": 125.5}},
+      "narration_text": "...",
+      "emotion": "平静",
+      "is_climax": false,
+      "bgm_required": false
+    }}
+  ]
+}}
