@@ -18,17 +18,15 @@ from bs4 import BeautifulSoup
 conf = importlib.import_module("conf")
 from .utils import clean_html_text, safe_request, safe_request_json
 
-try:
-    from rapidfuzz import fuzz
-    HAS_RAPIDFUZZ = True
-except ImportError:
-    HAS_RAPIDFUZZ = False
+from rapidfuzz import fuzz
 
 logger = logging.getLogger(__name__)
 
 
 def _load_prompt(prompt_name: str) -> str:
     """从 prompts 目录读取指定模板。"""
+    if not prompt_name.endswith('.txt'):
+        prompt_name = f"{prompt_name}.txt"
     prompt_file = Path(conf.PROMPTS_DIR) / prompt_name
     return prompt_file.read_text(encoding="utf-8")
 
@@ -50,16 +48,18 @@ class InfoCollector:
         self,
         movie_name: str,
         year: int | None = None,
-        keyscene_mode: bool = False,
+        keyscene_mode: bool = True,
         subtitles: list[dict[str, Any]] | None = None,
+        workspace: str | None = None,
     ) -> dict[str, Any]:
         """从多个来源采集电影信息并聚合返回。
 
         Args:
             movie_name: 电影名称
             year: 年份（可选）
-            keyscene_mode: 是否启用关键场景模式（生成完整 key_scenes 和剧情结构）
-            subtitles: 字幕列表（用于时间戳匹配，仅在 keyscene_mode=True 时使用）
+            keyscene_mode: 是否启用关键场景模式（生成完整 key_scenes）
+            subtitles: 字幕列表（用于时间戳匹配，默认自动从 workspace 加载）
+            workspace: 工作目录（用于自动加载字幕文件）
         """
         merged: dict[str, Any] = {
             "title": movie_name,
@@ -67,9 +67,7 @@ class InfoCollector:
             "genre": [],
             "synopsis": "",
             "characters": [],
-            "plot_structure": {},
             "key_scenes": [],
-            "emotional_arc": [],
         }
 
         for source in self.sources:
@@ -89,86 +87,29 @@ class InfoCollector:
             except (ValueError, RuntimeError, requests.RequestException) as error:
                 logger.warning("采集源 %s 执行失败: %s", source, error)
 
-        if keyscene_mode:
-            # 关键场景模式：使用多轮 LLM 增强 + 时间戳匹配
-            logger.info("启用关键场景模式，生成完整剧情结构...")
-            merged = self._enrich_with_llm_v2(movie_name, merged)
+        # 关键场景模式：使用多轮 LLM 增强 + 时间戳匹配
+        logger.info("启用关键场景模式，生成完整剧情结构...")
+        merged = self._enrich_with_llm_v2(movie_name, merged)
 
-            # 如果提供了字幕，自动匹配时间戳
-            if subtitles:
-                logger.info("自动匹配时间戳...")
-                merged = self._match_timestamps(merged, subtitles)
-        else:
-            # 标准模式：使用简化版 LLM 增强
-            merged = self._enrich_with_llm(movie_name, merged)
+        # 自动匹配时间戳：优先使用传入的 subtitles，否则尝试从 workspace 加载
+        if subtitles is None and workspace:
+            subtitles_path = Path(workspace) / "subtitles.json"
+            if subtitles_path.exists():
+                try:
+                    with subtitles_path.open("r", encoding="utf-8") as f:
+                        subtitles = json.load(f)
+                    logger.info("已自动加载字幕文件: %s", subtitles_path)
+                except Exception as e:
+                    logger.warning("加载字幕文件失败: %s", e)
+
+        if subtitles:
+            logger.info("自动匹配时间戳...")
+            merged = self._match_timestamps(merged, subtitles)
 
         logger.info("信息采集完成: title=%s", merged.get("title"))
         return merged
 
-    def _enrich_with_llm(self, movie_name: str, merged: dict[str, object]) -> dict[str, object]:
-        """使用 Qwen 对剧情做结构化增强。"""
-        if not str(conf.DASHSCOPE_API_KEY or "").strip():
-            return merged
-
-        try:
-            payload = {
-                "title": merged.get("title") or movie_name,
-                "year": merged.get("year") or 0,
-                "genre": merged.get("genre") or [],
-                "synopsis": merged.get("synopsis") or "",
-                "characters": merged.get("characters") or [],
-            }
-            prompt_template = _load_prompt("plot_enhancement.txt")
-            prompt = prompt_template.format(
-                target_chars_min=int(conf.M3_SYNOPSIS_TARGET_CHARS * 0.9),
-                target_chars_max=int(conf.M3_SYNOPSIS_TARGET_CHARS * 1.2),
-                movie_info_json=json.dumps(payload, ensure_ascii=False)
-            )
-
-            content = self._call_qwen(prompt, max_tokens=2400)
-            parsed = self._parse_json_response(content)
-            if not isinstance(parsed, dict):
-                return merged
-
-            synopsis = parsed.get("synopsis")
-            if isinstance(synopsis, str) and len(synopsis.strip()) >= int(conf.M3_SYNOPSIS_TARGET_CHARS * 0.3):
-                merged["synopsis"] = synopsis.strip()
-
-            characters = parsed.get("characters")
-            if isinstance(characters, list) and characters:
-                normalized_characters = []
-                for item in characters:
-                    if isinstance(item, dict):
-                        name = str(item.get("name", "")).strip()
-                        role = str(item.get("role", "")).strip()
-                        motivation = str(item.get("motivation", "")).strip()
-                        if name:
-                            normalized_characters.append(
-                                {"name": name, "role": role, "motivation": motivation}
-                            )
-                    elif isinstance(item, str) and item.strip():
-                        normalized_characters.append(item.strip())
-                if normalized_characters:
-                    merged["characters"] = normalized_characters
-
-            plot_structure = parsed.get("plot_structure")
-            if isinstance(plot_structure, dict) and plot_structure:
-                merged["plot_structure"] = self._strip_provenance_fields(plot_structure)
-
-            key_scenes = parsed.get("key_scenes")
-            if isinstance(key_scenes, list) and key_scenes:
-                merged["key_scenes"] = self._strip_provenance_fields(key_scenes)
-
-            emotional_arc = parsed.get("emotional_arc")
-            if isinstance(emotional_arc, list) and emotional_arc:
-                merged["emotional_arc"] = self._strip_provenance_fields(emotional_arc)
-        except (ValueError, RuntimeError, requests.RequestException, KeyError) as error:
-            logger.warning("M3 LLM 剧情增强失败，保留原始采集结果: %s", error)
-
-        merged = self._strip_provenance_fields(merged)
-        return merged
-
-    def _strip_provenance_fields(self, value: object) -> object:
+    def _strip_provenance_fields(self, value: Any) -> Any:
         """递归清理模型来源标记字段。"""
         forbidden_keys = {
             "generated_by",
@@ -187,116 +128,6 @@ class InfoCollector:
         if isinstance(value, list):
             return [self._strip_provenance_fields(item) for item in value]
         return value
-
-    def _call_qwen(self, prompt: str, max_tokens: int = 4096) -> str:
-        """调用 Qwen，优先 SDK，缺失时走 OpenAI 兼容 HTTP 接口。"""
-        if self.dashscope is not None:
-            response = self.dashscope.Generation.call(
-                model=conf.M3_QWEN_MODEL,
-                api_key=conf.DASHSCOPE_API_KEY,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0.6,
-                result_format="message",
-            )
-            return self._extract_llm_content(response)
-
-        endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-        payload = {
-            "model": conf.M3_QWEN_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.6,
-            "max_tokens": max_tokens,
-        }
-        headers = {
-            "Authorization": f"Bearer {conf.DASHSCOPE_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        last_error: Exception | None = None
-        for attempt in range(2):
-            try:
-                response = requests.post(endpoint, headers=headers, json=payload, timeout=180)
-                response.raise_for_status()
-                data = response.json()
-                if not isinstance(data, dict):
-                    raise RuntimeError("Qwen HTTP 返回格式异常")
-
-                choices = data.get("choices")
-                if isinstance(choices, list) and choices:
-                    first = choices[0]
-                    if isinstance(first, dict):
-                        message = first.get("message")
-                        if isinstance(message, dict):
-                            content = message.get("content")
-                            if isinstance(content, str):
-                                return content
-            except (requests.RequestException, ValueError, RuntimeError) as error:
-                last_error = error
-                logger.warning("Qwen HTTP 调用失败，重试中(%d/2): %s", attempt + 1, error)
-
-        if last_error is not None:
-            raise RuntimeError(f"Qwen HTTP 调用失败: {last_error}")
-
-        raise RuntimeError("Qwen HTTP 返回内容缺失")
-
-    def _extract_llm_content(self, response: object) -> str:
-        """统一提取 DashScope 文本内容。"""
-        if isinstance(response, dict):
-            status_code = response.get("status_code")
-            if isinstance(status_code, int) and status_code != 200:
-                raise RuntimeError(f"Qwen 调用失败: status_code={status_code}")
-
-            output = response.get("output")
-            if isinstance(output, dict):
-                choices = output.get("choices")
-                if isinstance(choices, list) and choices:
-                    first = choices[0]
-                    if isinstance(first, dict):
-                        message = first.get("message")
-                        if isinstance(message, dict):
-                            content = message.get("content")
-                            if isinstance(content, str):
-                                return content
-                text = output.get("text")
-                if isinstance(text, str):
-                    return text
-
-        response_output = getattr(response, "output", None)
-        if response_output is not None:
-            response_text = getattr(response_output, "text", None)
-            if isinstance(response_text, str):
-                return response_text
-            choices = getattr(response_output, "choices", None)
-            if isinstance(choices, list) and choices:
-                first = choices[0]
-                if isinstance(first, dict):
-                    message = first.get("message")
-                    if isinstance(message, dict):
-                        content = message.get("content")
-                        if isinstance(content, str):
-                            return content
-        raise RuntimeError("Qwen 返回格式无法解析")
-
-    def _parse_json_response(self, raw_text: str) -> dict[str, object] | list[object]:
-        """从 LLM 文本中提取并解析 JSON。"""
-        content = raw_text.strip()
-        if content.startswith("```"):
-            lines = content.splitlines()
-            if len(lines) >= 3:
-                content = "\n".join(lines[1:-1]).strip()
-
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as error:
-            logger.warning("M3 LLM JSON 解析失败: %s", error)
-            return {}
-
-        if isinstance(parsed, dict):
-            return parsed
-        if isinstance(parsed, list):
-            return parsed
-        return {}
 
     def _search_douban(self, movie_name: str) -> dict[str, object]:
         """通过豆瓣搜索页面抓取基础信息。"""
@@ -621,9 +452,7 @@ class InfoCollector:
             "genre": merged.get("genre", []),
             "synopsis": merged.get("synopsis", ""),
             "characters": merged.get("characters", []),
-            "plot_structure": merged.get("plot_structure", {}),
             "key_scenes": merged.get("key_scenes", []),
-            "emotional_arc": merged.get("emotional_arc", []),
         }
 
         current_messages = self._build_llm_messages(seed)
@@ -638,7 +467,7 @@ class InfoCollector:
             if not issues:
                 break
             if round_index == max_rounds - 1:
-                logger.warning("达到最大轮次，仍有 %d 个问题未解决", len(issues))
+                logger.warning("达到最大轮次，仍有 %d 个问题未解决: %s", len(issues), issues)
                 break
             current_messages = self._build_revision_messages(seed, normalized, issues)
 
@@ -649,14 +478,17 @@ class InfoCollector:
 
     def _build_llm_messages(self, seed: dict[str, Any]) -> list[dict[str, str]]:
         """构建初始 LLM 消息（整合自 regenerate_movie_info_with_qwen.py）"""
+        importance_criteria = _load_prompt("importance_criteria")
         payload = {
             "task": "重建完整 movie_info.json，所有文本字段都由模型生成",
             "hard_rules": [
                 "必须输出严格JSON，不得输出任何解释文字",
                 "场景数量保持与输入 key_scenes 相同",
                 "scene_id 必须连续并与输入 scene_id 一一对应",
-                "importance 必须为 1-10 整数",
-                "confidence 必须为 0-1 浮点",
+                "importance_breakdown 包含 plot_advancement/emotional_impact/turning_point/character_development 四个维度，各为 1-10 整数",
+                "importance 由 importance_breakdown 加权计算得出（代码层面处理），importance 字段可省略或任意值",
+                "score_reason 必须详细说明每个维度的打分依据，不少于 30 字",
+                "四维分数建议呈正态分布：7-10分占15-25%，4-6分占50-70%，1-3分占15-25%",
                 "synopsis 必须是 900-1200 字中文完整剧情梳理，按时间推进覆盖开端-发展-转折-高潮-结局",
                 "chapter_breakdown 覆盖 6 个 phase: setup, inciting_incident, rising_action, midpoint, climax, resolution",
                 "sample_dialogue 必须是2句中文对白",
@@ -664,6 +496,7 @@ class InfoCollector:
                 "key_scenes 每一项都必须细化：summary/scene_goal/conflict/turning_point 至少 18 字，action_line 至少 12 字",
                 "禁止输出 generated_by、importance_source、details_source、content_generated_by、generation_method 等模型来源字段",
             ],
+            "importance_criteria": importance_criteria,
             "seed": seed,
             "output_schema": {
                 "title": "string",
@@ -698,7 +531,12 @@ class InfoCollector:
                         "scene_id": "int",
                         "phase": "string",
                         "summary": "string",
-                        "importance": "int",
+                        "importance_breakdown": {
+                            "plot_advancement": "int",
+                            "emotional_impact": "int",
+                            "turning_point": "int",
+                            "character_development": "int"
+                        },
                         "suggested_emotion": "string",
                         "location": "string",
                         "characters_present": ["string"],
@@ -711,7 +549,6 @@ class InfoCollector:
                         "sample_dialogue": ["string", "string"],
                         "unique_keywords": ["string"],
                         "score_reason": "string",
-                        "confidence": "float",
                     }
                 ],
                 "emotional_arc": [{"stage": "string", "emotion": "string"}],
@@ -726,6 +563,7 @@ class InfoCollector:
 
     def _build_revision_messages(self, seed: dict[str, Any], draft: dict[str, Any], issues: list[str]) -> list[dict[str, str]]:
         """构建修复消息"""
+        importance_criteria = _load_prompt("importance_criteria")
         payload = {
             "task": "修复 movie_info.json 质量问题，必须输出完整 JSON",
             "issues": issues,
@@ -733,11 +571,15 @@ class InfoCollector:
                 "必须输出严格JSON，不得输出任何解释文字",
                 "synopsis 必须是 900-1200 字中文完整剧情梳理",
                 "场景数量保持与输入一致，scene_id 与输入一一对应",
-                "importance 为 1-10 整数，confidence 为 0-1 浮点",
+                "importance_breakdown 包含 plot_advancement/emotional_impact/turning_point/character_development 四个维度，各为 1-10 整数",
+                "importance 由 importance_breakdown 加权计算得出（代码层面处理），importance 字段可省略或任意值",
+                "score_reason 必须详细说明每个维度的打分依据，不少于 30 字",
                 "summary/scene_goal/conflict/turning_point 每项不少于18字",
                 "sample_dialogue 必须是2句中文对白",
+                "四维分数建议呈正态分布：7-10分占15-25%，4-6分占50-70%，1-3分占15-25%",
                 "禁止输出 generated_by、importance_source、details_source、content_generated_by、generation_method",
             ],
+            "importance_criteria": importance_criteria,
             "seed": seed,
             "draft": draft,
         }
@@ -769,7 +611,7 @@ class InfoCollector:
                         "Authorization": f"Bearer {api_key}",
                     },
                 )
-                with request.urlopen(req, timeout=300) as resp:
+                with request.urlopen(req, timeout=600) as resp:
                     content = resp.read().decode("utf-8")
                 parsed = json.loads(content)
                 response_text = parsed["choices"][0]["message"]["content"]
@@ -800,7 +642,7 @@ class InfoCollector:
             except (TypeError, ValueError):
                 continue
         if not expected_ids:
-            expected_ids = list(range(1, 11))
+            expected_ids = list(range(1, 21))
 
         payload = {
             "title": str(result.get("title", seed.get("title", ""))),
@@ -808,11 +650,7 @@ class InfoCollector:
             "genre": result.get("genre", seed.get("genre", [])),
             "synopsis": str(result.get("synopsis", "")),
             "characters": result.get("characters", []),
-            "plot_structure": result.get("plot_structure", {}),
-            "chapter_breakdown": result.get("chapter_breakdown", []),
-            "key_scenes": self._normalize_scenes_v2(result.get("key_scenes", []), expected_ids),
-            "emotional_arc": result.get("emotional_arc", []),
-            "usage_notes": result.get("usage_notes", []),
+            "key_scenes": self._normalize_scenes_v2(result.get("key_scenes") or [], expected_ids),
         }
 
         return self._strip_provenance_fields(payload)
@@ -831,17 +669,25 @@ class InfoCollector:
         normalized: list[dict[str, Any]] = []
         for scene_id in expected_ids:
             source = by_id.get(scene_id, {"scene_id": scene_id})
-            try:
-                importance = int(source.get("importance", 6))
-            except (TypeError, ValueError):
-                importance = 6
-            importance = max(1, min(10, importance))
 
-            try:
-                confidence = float(source.get("confidence", 0.8))
-            except (TypeError, ValueError):
-                confidence = 0.8
-            confidence = max(0.0, min(1.0, confidence))
+            breakdown_raw = source.get("importance_breakdown", {})
+            if not isinstance(breakdown_raw, dict):
+                breakdown_raw = {}
+            importance_breakdown = {
+                "plot_advancement": max(1, min(10, int(breakdown_raw.get("plot_advancement", 6)))),
+                "emotional_impact": max(1, min(10, int(breakdown_raw.get("emotional_impact", 6)))),
+                "turning_point": max(1, min(10, int(breakdown_raw.get("turning_point", 6)))),
+                "character_development": max(1, min(10, int(breakdown_raw.get("character_development", 6)))),
+            }
+
+            importance = (
+                importance_breakdown["plot_advancement"] * 0.3 +
+                importance_breakdown["emotional_impact"] * 0.25 +
+                importance_breakdown["turning_point"] * 0.25 +
+                importance_breakdown["character_development"] * 0.2
+            )
+            importance = round(importance, 1)
+            importance = max(1.0, min(10.0, importance))
 
             raw_dialogue = source.get("sample_dialogue", [])
             if not isinstance(raw_dialogue, list):
@@ -860,6 +706,7 @@ class InfoCollector:
                     "phase": str(source.get("phase", "")).strip(),
                     "summary": str(source.get("summary", "")).strip(),
                     "importance": importance,
+                    "importance_breakdown": importance_breakdown,
                     "suggested_emotion": str(source.get("suggested_emotion", "")).strip(),
                     "location": str(source.get("location", "")).strip(),
                     "characters_present": [str(ch).strip() for ch in raw_chars if str(ch).strip()],
@@ -872,7 +719,6 @@ class InfoCollector:
                     "sample_dialogue": sample_dialogue,
                     "unique_keywords": [str(kw).strip() for kw in source.get("unique_keywords", []) if str(kw).strip()][:4],
                     "score_reason": str(source.get("score_reason", "")).strip(),
-                    "confidence": confidence,
                 }
             )
         return normalized
@@ -885,7 +731,7 @@ class InfoCollector:
         if synopsis_len < 900:
             issues.append(f"synopsis 过短，当前约 {synopsis_len} 字，需扩展至 900-1200 字")
 
-        expected_scene_count = len(seed.get("key_scenes", [])) or 10
+        expected_scene_count = len(seed.get("key_scenes", [])) or 20
         scenes_obj = payload.get("key_scenes", [])
         scenes = scenes_obj if isinstance(scenes_obj, list) else []
         if len(scenes) != expected_scene_count:
@@ -903,13 +749,24 @@ class InfoCollector:
             dialogues = dialogues_obj if isinstance(dialogues_obj, list) else []
             if len(dialogues) < 2 or not str(dialogues[0]).strip() or not str(dialogues[1]).strip():
                 issues.append(f"scene {index} 的 sample_dialogue 不满足2句中文对白")
+            breakdown = scene.get("importance_breakdown", {})
+            if not isinstance(breakdown, dict):
+                issues.append(f"scene {index} 缺少 importance_breakdown 四维评分")
+            else:
+                required_dims = ["plot_advancement", "emotional_impact", "turning_point", "character_development"]
+                for dim in required_dims:
+                    if dim not in breakdown:
+                        issues.append(f"scene {index} 缺少 {dim} 维度评分")
+            score_reason = str(scene.get("score_reason", "")).strip()
+            if len(score_reason) < 30:
+                issues.append(f"scene {index} 的 score_reason 过短，需至少30字说明打分依据")
 
         return issues
 
     def _match_timestamps(self, movie_info: dict[str, Any], subtitles: list[dict[str, Any]]) -> dict[str, Any]:
         """为 key_scenes 匹配视频时间戳（整合自 add_keyscene_timestamps.py）"""
         total_duration = subtitles[-1]["end"] if subtitles else 6926
-        logger.info("电影时长: %.1f 分钟，使用模糊匹配库: %s", total_duration / 60, "rapidfuzz" if HAS_RAPIDFUZZ else "difflib")
+        logger.info("电影时长: %.1f 分钟，使用模糊匹配库: rapidfuzz", total_duration / 60)
 
         results = []
         prev_end = 0
@@ -950,11 +807,7 @@ class InfoCollector:
 
     def _fuzzy_match(self, keyword: str, text: str, threshold: float = 75) -> float:
         """模糊匹配关键词和文本"""
-        if HAS_RAPIDFUZZ:
-            score = fuzz.partial_ratio(keyword, text)
-        else:
-            score = SequenceMatcher(None, keyword, text).ratio() * 100
-            score = max(score, SequenceMatcher(None, keyword, text[:len(keyword)+5]).ratio() * 100)
+        score = fuzz.partial_ratio(keyword, text)
         return score if score >= threshold else 0
 
     def _find_best_match(self, keyword: str, subtitles: list[dict[str, Any]], threshold: float = 75) -> list[dict[str, Any]]:

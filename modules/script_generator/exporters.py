@@ -130,9 +130,8 @@ class ScriptExporter:
         emotion = scene.get("suggested_emotion", "")
         scene_goal = scene.get("scene_goal", "")
         importance = scene.get("importance", "")
-        importance_source = scene.get("importance_source", "")
+        importance_breakdown = scene.get("importance_breakdown", {})
         score_reason = scene.get("score_reason", "")
-        confidence = scene.get("confidence", "")
         conflict = scene.get("conflict", "")
         turning_point = scene.get("turning_point", "")
         visual_tone = scene.get("visual_tone", "")
@@ -149,14 +148,24 @@ class ScriptExporter:
         ]
 
         if importance != "":
-            if importance_source:
-                lines.append(f"- 场景重要度：{importance}/10（来源：{importance_source}）")
+            dim_names = {
+                "plot_advancement": "情节推动力",
+                "emotional_impact": "情感冲击",
+                "turning_point": "转折重要性",
+                "character_development": "人物塑造"
+            }
+            breakdown_strs = []
+            if isinstance(importance_breakdown, dict):
+                for dim_key, dim_name in dim_names.items():
+                    dim_val = importance_breakdown.get(dim_key, "")
+                    if dim_val != "":
+                        breakdown_strs.append(f"{dim_name}:{dim_val}")
+            if breakdown_strs:
+                lines.append(f"- 场景重要度：{importance}/10 ({'/'.join(breakdown_strs)})")
             else:
                 lines.append(f"- 场景重要度：{importance}/10")
         if score_reason:
             lines.append(f"- 评分依据：{score_reason}")
-        if confidence != "":
-            lines.append(f"- 评分置信度：{confidence}")
 
         if chapter:
             lines.append(f"- 所属章节：{chapter.get('title', chapter.get('phase', ''))}")

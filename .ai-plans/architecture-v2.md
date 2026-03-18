@@ -212,7 +212,7 @@ python main.py export-script <workspace_path> --output <output_path>
   - 执行信息：`characters_present`, `visual_tone`, `dialogue_focus`, `action_line`
   - 关键词：`unique_keywords`（用于字幕匹配）
   - 对话：`sample_dialogue`（2句示例对白）
-  - 元数据：`score_reason`, `confidence`
+  - 元数据：`score_reason`
 - 质量保障：
   - 自动质量校验（`_assess_quality_v2`）
   - 多轮自动修正（max 3 rounds）
