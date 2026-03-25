@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import time
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -16,19 +15,35 @@ import requests
 from bs4 import BeautifulSoup
 
 conf = importlib.import_module("conf")
-from .utils import clean_html_text, safe_request, safe_request_json
-
-from rapidfuzz import fuzz
+from .utils import (
+    clean_html_text,
+    safe_request,
+    safe_request_json,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _load_prompt(prompt_name: str) -> str:
-    """从 prompts 目录读取指定模板。"""
+def _load_prompt(prompt_name: str, **kwargs) -> str:
+    """从 prompts 目录读取指定模板，支持占位符替换。
+    
+    Args:
+        prompt_name: prompt 文件名（不含 .txt 后缀）
+        **kwargs: 占位符键值对，如 sample_dialogue_count=6
+    
+    Returns:
+        替换后的 prompt 文本
+    """
     if not prompt_name.endswith('.txt'):
         prompt_name = f"{prompt_name}.txt"
     prompt_file = Path(conf.PROMPTS_DIR) / prompt_name
-    return prompt_file.read_text(encoding="utf-8")
+    content = prompt_file.read_text(encoding="utf-8")
+    
+    for key, value in kwargs.items():
+        placeholder = f"{{{key}}}"
+        content = content.replace(placeholder, str(value))
+    
+    return content
 
 
 class InfoCollector:
@@ -51,6 +66,7 @@ class InfoCollector:
         keyscene_mode: bool = True,
         subtitles: list[dict[str, Any]] | None = None,
         workspace: str | None = None,
+        keywords: list[str] | None = None,
     ) -> dict[str, Any]:
         """从多个来源采集电影信息并聚合返回。
 
@@ -60,6 +76,7 @@ class InfoCollector:
             keyscene_mode: 是否启用关键场景模式（生成完整 key_scenes）
             subtitles: 字幕列表（用于时间戳匹配，默认自动从 workspace 加载）
             workspace: 工作目录（用于自动加载字幕文件）
+            keywords: 关键词列表（用于联网检索上下文增强）
         """
         merged: dict[str, Any] = {
             "title": movie_name,
@@ -87,9 +104,12 @@ class InfoCollector:
             except (ValueError, RuntimeError, requests.RequestException) as error:
                 logger.warning("采集源 %s 执行失败: %s", source, error)
 
-        # 关键场景模式：使用多轮 LLM 增强 + 时间戳匹配
-        logger.info("启用关键场景模式，生成完整剧情结构...")
-        merged = self._enrich_with_llm_v2(movie_name, merged)
+        search_context = self._collect_search_context_by_keywords(movie_name, keywords, year=year)
+        if search_context:
+            merged["search_context"] = search_context
+
+        min_scene_count = max(1, int(getattr(conf, "M3_KEYSCENE_MIN", 10)))
+        max_scene_count = max(min_scene_count, int(getattr(conf, "M3_KEYSCENE_MAX", 20)))
 
         # 自动匹配时间戳：优先使用传入的 subtitles，否则尝试从 workspace 加载
         if subtitles is None and workspace:
@@ -102,12 +122,142 @@ class InfoCollector:
                 except Exception as e:
                     logger.warning("加载字幕文件失败: %s", e)
 
+        target_scene_count = self._estimate_scene_count(subtitles, min_scene_count, max_scene_count)
+
+        # 关键场景模式：使用多轮 LLM 增强 + 时间戳匹配
+        logger.info("启用关键场景模式，生成完整剧情结构（场景数范围: %d-%d）...", min_scene_count, max_scene_count)
+        merged = self._enrich_with_llm_v2(
+            movie_name,
+            merged,
+            min_scene_count=min_scene_count,
+            max_scene_count=max_scene_count,
+            target_scene_count=target_scene_count,
+            search_context=search_context,
+            subtitles=subtitles or [],
+        )
+
         if subtitles:
             logger.info("自动匹配时间戳...")
             merged = self._match_timestamps(merged, subtitles)
 
         logger.info("信息采集完成: title=%s", merged.get("title"))
         return merged
+
+    def _estimate_scene_count(
+        self,
+        subtitles: list[dict[str, Any]] | None,
+        min_scene_count: int,
+        max_scene_count: int,
+    ) -> int:
+        """根据字幕密度估算场景数量（仅作为模型建议值）。"""
+        midpoint = int(round((min_scene_count + max_scene_count) / 2))
+        if not subtitles:
+            return max(min_scene_count, min(max_scene_count, midpoint))
+
+        try:
+            total_duration = float(subtitles[-1].get("end", 0.0))
+        except (TypeError, ValueError, IndexError, AttributeError):
+            total_duration = 0.0
+
+        if total_duration <= 0:
+            return max(min_scene_count, min(max_scene_count, midpoint))
+
+        subtitle_count = len(subtitles)
+        duration_based = int(round((total_duration / 60.0) / 8.0))
+        density_bonus = 1 if subtitle_count >= 1500 else 0
+        estimated = duration_based + density_bonus
+        return max(min_scene_count, min(max_scene_count, estimated))
+
+    def _collect_search_context_by_keywords(
+        self,
+        movie_name: str,
+        keywords: list[str] | None,
+        year: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """关键词联网检索：代码抓取，再交给 Qwen 归纳。"""
+        query_terms: list[str] = []
+        base_term = str(movie_name or "").strip()
+        if base_term:
+            query_terms.append(base_term)
+
+        if isinstance(keywords, list):
+            for item in keywords:
+                value = str(item or "").strip()
+                if value and value not in query_terms:
+                    query_terms.append(value)
+
+        if not query_terms:
+            return []
+
+        max_terms = 8
+        max_hits = 30
+        seen: set[str] = set()
+        hits: list[dict[str, Any]] = []
+
+        for term in query_terms[:max_terms]:
+            source_results: list[tuple[str, dict[str, object]]] = []
+
+            try:
+                source_results.append(("douban", self._search_douban(term)))
+            except (ValueError, RuntimeError, requests.RequestException):
+                source_results.append(("douban", {}))
+
+            try:
+                source_results.append(("baidu_baike", self._search_baidu_baike(term)))
+            except (ValueError, RuntimeError, requests.RequestException):
+                source_results.append(("baidu_baike", {}))
+
+            try:
+                source_results.append(("tmdb", self._search_tmdb(term, year=year if term == movie_name else None)))
+            except (ValueError, RuntimeError, requests.RequestException):
+                source_results.append(("tmdb", {}))
+
+            try:
+                source_results.append(("imdb_omdb", self._search_imdb_omdb(term)))
+            except (ValueError, RuntimeError, requests.RequestException):
+                source_results.append(("imdb_omdb", {}))
+
+            for source, data in source_results:
+                if not isinstance(data, dict) or not data:
+                    continue
+
+                title = str(data.get("title") or "").strip()
+                synopsis = str(data.get("synopsis") or "").strip()
+                if not title and not synopsis:
+                    continue
+
+                signature = f"{source}|{title}|{synopsis[:120]}"
+                if signature in seen:
+                    continue
+                seen.add(signature)
+
+                genre_value = data.get("genre", [])
+                if not isinstance(genre_value, list):
+                    genre_value = []
+                characters_value = data.get("characters", [])
+                if not isinstance(characters_value, list):
+                    characters_value = []
+
+                hits.append(
+                    {
+                        "keyword": term,
+                        "source": source,
+                        "title": title,
+                        "year": self._extract_year(str(data.get("year", "") or "")),
+                        "genre": [str(item).strip() for item in genre_value if str(item).strip()][:8],
+                        "characters": [str(item).strip() for item in characters_value if str(item).strip()][:12],
+                        "synopsis": synopsis[:1200],
+                    }
+                )
+
+                if len(hits) >= max_hits:
+                    break
+
+            if len(hits) >= max_hits:
+                break
+
+        logger.info("关键词联网检索完成：%d 条上下文", len(hits))
+        return hits
 
     def _strip_provenance_fields(self, value: Any) -> Any:
         """递归清理模型来源标记字段。"""
@@ -436,7 +586,16 @@ class InfoCollector:
             return True
         return False
 
-    def _enrich_with_llm_v2(self, movie_name: str, merged: dict[str, Any]) -> dict[str, Any]:
+    def _enrich_with_llm_v2(
+        self,
+        movie_name: str,
+        merged: dict[str, Any],
+        min_scene_count: int,
+        max_scene_count: int,
+        target_scene_count: int,
+        search_context: list[dict[str, Any]] | None = None,
+        subtitles: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """使用多轮 Qwen 对剧情做结构化增强（整合自 regenerate_movie_info_with_qwen.py）"""
         if not str(conf.DASHSCOPE_API_KEY or "").strip():
             logger.warning("未配置 DASHSCOPE_API_KEY，跳过 LLM 增强")
@@ -455,137 +614,179 @@ class InfoCollector:
             "key_scenes": merged.get("key_scenes", []),
         }
 
-        current_messages = self._build_llm_messages(seed)
+        current_messages = self._build_llm_messages(
+            seed,
+            min_scene_count=min_scene_count,
+            max_scene_count=max_scene_count,
+            target_scene_count=target_scene_count,
+            search_context=search_context or [],
+            subtitles=subtitles or [],
+        )
         result: dict[str, Any] = {}
         normalized: dict[str, Any] = {}
         max_rounds = 3
 
         for round_index in range(max_rounds):
             result = self._call_llm_v2(base_url, api_key, model, current_messages)
-            normalized = self._normalize_output_v2(result, seed)
-            issues = self._assess_quality_v2(normalized, seed)
+            normalized = self._normalize_output_v2(
+                result,
+                seed,
+                min_scene_count=min_scene_count,
+                max_scene_count=max_scene_count,
+                target_scene_count=target_scene_count,
+            )
+            issues = self._assess_quality_v2(
+                normalized,
+                seed,
+                min_scene_count=min_scene_count,
+                max_scene_count=max_scene_count,
+            )
             if not issues:
                 break
             if round_index == max_rounds - 1:
                 logger.warning("达到最大轮次，仍有 %d 个问题未解决: %s", len(issues), issues)
                 break
-            current_messages = self._build_revision_messages(seed, normalized, issues)
+            current_messages = self._build_revision_messages(
+                seed,
+                normalized,
+                issues,
+                min_scene_count=min_scene_count,
+                max_scene_count=max_scene_count,
+                target_scene_count=target_scene_count,
+                search_context=search_context or [],
+                subtitles=subtitles or [],
+            )
 
         merged.update(normalized)
         merged = self._strip_provenance_fields(merged)
         logger.info("LLM 增强完成，生成 %d 个关键场景", len(merged.get("key_scenes", [])))
         return merged
 
-    def _build_llm_messages(self, seed: dict[str, Any]) -> list[dict[str, str]]:
-        """构建初始 LLM 消息（整合自 regenerate_movie_info_with_qwen.py）"""
+    def _build_llm_messages(
+        self,
+        seed: dict[str, Any],
+        min_scene_count: int,
+        max_scene_count: int,
+        target_scene_count: int,
+        search_context: list[dict[str, Any]],
+        subtitles: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """构建初始 LLM 消息"""
+        sample_dialogue_count = getattr(conf, "SAMPLE_DIALOGUE_COUNT", 6)
         importance_criteria = _load_prompt("importance_criteria")
-        payload = {
-            "task": "重建完整 movie_info.json，所有文本字段都由模型生成",
-            "hard_rules": [
-                "必须输出严格JSON，不得输出任何解释文字",
-                "场景数量保持与输入 key_scenes 相同",
-                "scene_id 必须连续并与输入 scene_id 一一对应",
-                "importance_breakdown 包含 plot_advancement/emotional_impact/turning_point/character_development 四个维度，各为 1-10 整数",
-                "importance 由 importance_breakdown 加权计算得出（代码层面处理），importance 字段可省略或任意值",
-                "score_reason 必须详细说明每个维度的打分依据，不少于 30 字",
-                "四维分数建议呈正态分布：7-10分占15-25%，4-6分占50-70%，1-3分占15-25%",
-                "synopsis 必须是 900-1200 字中文完整剧情梳理，按时间推进覆盖开端-发展-转折-高潮-结局",
-                "chapter_breakdown 覆盖 6 个 phase: setup, inciting_incident, rising_action, midpoint, climax, resolution",
-                "sample_dialogue 必须是2句中文对白",
-                "unique_keywords 必须是2-4个短动词、名词短语或形容词，在10个字以内就可以，并且每个片段之间unique_keywords需要有区分度，使其能够作为区分每个片段的关键词",
-                "key_scenes 每一项都必须细化：summary/scene_goal/conflict/turning_point 至少 18 字，action_line 至少 12 字",
-                "禁止输出 generated_by、importance_source、details_source、content_generated_by、generation_method 等模型来源字段",
+        output_schema = {
+            "title": "string",
+            "year": "int",
+            "genre": ["string"],
+            "synopsis": "string",
+            "characters": [
+                {"name": "string", "role": "string", "motivation": "string"}
             ],
-            "importance_criteria": importance_criteria,
-            "seed": seed,
-            "output_schema": {
-                "title": "string",
-                "year": "int",
-                "genre": ["string"],
-                "synopsis": "string",
-                "characters": [
-                    {"name": "string", "role": "string", "motivation": "string"}
-                ],
-                "plot_structure": {
-                    "setup": "string",
-                    "inciting_incident": "string",
-                    "rising_action": "string",
-                    "midpoint": "string",
-                    "climax": "string",
-                    "resolution": "string",
-                },
-                "chapter_breakdown": [
-                    {
-                        "chapter_id": "int",
-                        "phase": "string",
-                        "title": "string",
-                        "core_goal": "string",
-                        "main_conflict": "string",
-                        "plot_progress": "string",
-                        "emotional_shift": "string",
-                        "stakes": "string",
-                    }
-                ],
-                "key_scenes": [
-                    {
-                        "scene_id": "int",
-                        "phase": "string",
-                        "summary": "string",
-                        "importance_breakdown": {
-                            "plot_advancement": "int",
-                            "emotional_impact": "int",
-                            "turning_point": "int",
-                            "character_development": "int"
-                        },
-                        "suggested_emotion": "string",
-                        "location": "string",
-                        "characters_present": ["string"],
-                        "scene_goal": "string",
-                        "conflict": "string",
-                        "turning_point": "string",
-                        "visual_tone": "string",
-                        "dialogue_focus": "string",
-                        "action_line": "string",
-                        "sample_dialogue": ["string", "string"],
-                        "unique_keywords": ["string"],
-                        "score_reason": "string",
-                    }
-                ],
-                "emotional_arc": [{"stage": "string", "emotion": "string"}],
-                "usage_notes": ["string"],
+            "plot_structure": {
+                "setup": "string",
+                "inciting_incident": "string",
+                "rising_action": "string",
+                "midpoint": "string",
+                "climax": "string",
+                "resolution": "string",
             },
+            "chapter_breakdown": [
+                {
+                    "chapter_id": "int",
+                    "phase": "string",
+                    "title": "string",
+                    "core_goal": "string",
+                    "main_conflict": "string",
+                    "plot_progress": "string",
+                    "emotional_shift": "string",
+                    "stakes": "string",
+                }
+            ],
+            "key_scenes": [
+                {
+                    "scene_id": "int",
+                    "phase": "string",
+                    "summary": "string",
+                    "subtitle_range": {
+                        "start_index": "int",
+                        "end_index": "int",
+                    },
+                    "importance_breakdown": {
+                        "plot_advancement": "int",
+                        "emotional_impact": "int",
+                        "turning_point": "int",
+                        "character_development": "int",
+                    },
+                    "suggested_emotion": "string",
+                    "location": "string",
+                    "characters_present": ["string"],
+                    "scene_goal": "string",
+                    "conflict": "string",
+                    "turning_point": "string",
+                    "visual_tone": "string",
+                    "dialogue_focus": "string",
+                    "action_line": "string",
+                    "sample_dialogue": ["string"],
+                    "score_reason": "string",
+                }
+            ],
+            "emotional_arc": [{"stage": "string", "emotion": "string"}],
+            "usage_notes": ["string"],
         }
+
+        prompt = _load_prompt(
+            "m3_keyscene",
+            mode="initial",
+            min_scene_count=min_scene_count,
+            max_scene_count=max_scene_count,
+            target_scene_count=target_scene_count,
+            sample_dialogue_count=sample_dialogue_count,
+            importance_criteria=importance_criteria,
+            search_context_json=json.dumps(search_context, ensure_ascii=False, indent=2),
+            seed_json=json.dumps(seed, ensure_ascii=False, indent=2),
+            subtitles_json=json.dumps(subtitles, ensure_ascii=False, indent=2),
+            output_schema_json=json.dumps(output_schema, ensure_ascii=False, indent=2),
+            issues_json="[]",
+            draft_json="{}",
+        )
 
         return [
             {"role": "system", "content": "你是电影结构化编剧助手，擅长输出严格 JSON。"},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            {"role": "user", "content": prompt},
         ]
 
-    def _build_revision_messages(self, seed: dict[str, Any], draft: dict[str, Any], issues: list[str]) -> list[dict[str, str]]:
+    def _build_revision_messages(
+        self,
+        seed: dict[str, Any],
+        draft: dict[str, Any],
+        issues: list[str],
+        min_scene_count: int,
+        max_scene_count: int,
+        target_scene_count: int,
+        search_context: list[dict[str, Any]],
+        subtitles: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
         """构建修复消息"""
+        sample_dialogue_count = getattr(conf, "SAMPLE_DIALOGUE_COUNT", 6)
         importance_criteria = _load_prompt("importance_criteria")
-        payload = {
-            "task": "修复 movie_info.json 质量问题，必须输出完整 JSON",
-            "issues": issues,
-            "hard_rules": [
-                "必须输出严格JSON，不得输出任何解释文字",
-                "synopsis 必须是 900-1200 字中文完整剧情梳理",
-                "场景数量保持与输入一致，scene_id 与输入一一对应",
-                "importance_breakdown 包含 plot_advancement/emotional_impact/turning_point/character_development 四个维度，各为 1-10 整数",
-                "importance 由 importance_breakdown 加权计算得出（代码层面处理），importance 字段可省略或任意值",
-                "score_reason 必须详细说明每个维度的打分依据，不少于 30 字",
-                "summary/scene_goal/conflict/turning_point 每项不少于18字",
-                "sample_dialogue 必须是2句中文对白",
-                "四维分数建议呈正态分布：7-10分占15-25%，4-6分占50-70%，1-3分占15-25%",
-                "禁止输出 generated_by、importance_source、details_source、content_generated_by、generation_method",
-            ],
-            "importance_criteria": importance_criteria,
-            "seed": seed,
-            "draft": draft,
-        }
+        prompt = _load_prompt(
+            "m3_keyscene",
+            mode="revision",
+            min_scene_count=min_scene_count,
+            max_scene_count=max_scene_count,
+            target_scene_count=target_scene_count,
+            sample_dialogue_count=sample_dialogue_count,
+            importance_criteria=importance_criteria,
+            output_schema_json="{}",
+            issues_json=json.dumps(issues, ensure_ascii=False, indent=2),
+            search_context_json=json.dumps(search_context, ensure_ascii=False, indent=2),
+            seed_json=json.dumps(seed, ensure_ascii=False, indent=2),
+            subtitles_json=json.dumps(subtitles, ensure_ascii=False, indent=2),
+            draft_json=json.dumps(draft, ensure_ascii=False, indent=2),
+        )
         return [
             {"role": "system", "content": "你是电影结构化编剧助手，擅长输出严格 JSON。"},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            {"role": "user", "content": prompt},
         ]
 
     def _call_llm_v2(self, base_url: str, api_key: str, model: str, messages: list[dict[str, str]]) -> dict[str, Any]:
@@ -632,17 +833,20 @@ class InfoCollector:
             cleaned = re.sub(r"```$", "", cleaned).strip()
         return json.loads(cleaned)
 
-    def _normalize_output_v2(self, result: dict[str, Any], seed: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_output_v2(
+        self,
+        result: dict[str, Any],
+        seed: dict[str, Any],
+        min_scene_count: int,
+        max_scene_count: int,
+        target_scene_count: int,
+    ) -> dict[str, Any]:
         """标准化 LLM 输出（整合自 regenerate_movie_info_with_qwen.py）"""
-        expected_ids = []
-        for scene in seed.get("key_scenes", []):
-            try:
-                raw_scene_id = scene.get("scene_id")
-                expected_ids.append(int(raw_scene_id if raw_scene_id is not None else -1))
-            except (TypeError, ValueError):
-                continue
-        if not expected_ids:
-            expected_ids = list(range(1, 21))
+        scenes_obj = result.get("key_scenes", [])
+        scenes_list = scenes_obj if isinstance(scenes_obj, list) else []
+        proposed_count = len(scenes_list) if scenes_list else target_scene_count
+        scene_count = max(min_scene_count, min(max_scene_count, proposed_count))
+        expected_ids = list(range(1, scene_count + 1))
 
         payload = {
             "title": str(result.get("title", seed.get("title", ""))),
@@ -689,11 +893,12 @@ class InfoCollector:
             importance = round(importance, 1)
             importance = max(1.0, min(10.0, importance))
 
+            sample_dialogue_count = getattr(conf, "SAMPLE_DIALOGUE_COUNT", 6)
             raw_dialogue = source.get("sample_dialogue", [])
             if not isinstance(raw_dialogue, list):
                 raw_dialogue = []
-            sample_dialogue = [str(line).strip() for line in raw_dialogue if str(line).strip()][:2]
-            while len(sample_dialogue) < 2:
+            sample_dialogue = [str(line).strip() for line in raw_dialogue if str(line).strip()][:sample_dialogue_count]
+            while len(sample_dialogue) < sample_dialogue_count:
                 sample_dialogue.append("")
 
             raw_chars = source.get("characters_present", [])
@@ -705,6 +910,7 @@ class InfoCollector:
                     "scene_id": scene_id,
                     "phase": str(source.get("phase", "")).strip(),
                     "summary": str(source.get("summary", "")).strip(),
+                    "subtitle_range": self._normalize_subtitle_range(source.get("subtitle_range", {})),
                     "importance": importance,
                     "importance_breakdown": importance_breakdown,
                     "suggested_emotion": str(source.get("suggested_emotion", "")).strip(),
@@ -717,13 +923,37 @@ class InfoCollector:
                     "dialogue_focus": str(source.get("dialogue_focus", "")).strip(),
                     "action_line": str(source.get("action_line", "")).strip(),
                     "sample_dialogue": sample_dialogue,
-                    "unique_keywords": [str(kw).strip() for kw in source.get("unique_keywords", []) if str(kw).strip()][:4],
                     "score_reason": str(source.get("score_reason", "")).strip(),
                 }
             )
         return normalized
 
-    def _assess_quality_v2(self, payload: dict[str, Any], seed: dict[str, Any]) -> list[str]:
+    def _normalize_subtitle_range(self, value: Any) -> dict[str, int]:
+        """标准化 subtitle_range，确保字段存在。"""
+        if not isinstance(value, dict):
+            value = {}
+
+        try:
+            start_index = int(value.get("start_index", -1))
+        except (TypeError, ValueError):
+            start_index = -1
+        try:
+            end_index = int(value.get("end_index", -1))
+        except (TypeError, ValueError):
+            end_index = -1
+
+        return {
+            "start_index": start_index,
+            "end_index": end_index,
+        }
+
+    def _assess_quality_v2(
+        self,
+        payload: dict[str, Any],
+        seed: dict[str, Any],
+        min_scene_count: int,
+        max_scene_count: int,
+    ) -> list[str]:
         """评估输出质量并返回问题列表"""
         issues: list[str] = []
 
@@ -731,11 +961,12 @@ class InfoCollector:
         if synopsis_len < 900:
             issues.append(f"synopsis 过短，当前约 {synopsis_len} 字，需扩展至 900-1200 字")
 
-        expected_scene_count = len(seed.get("key_scenes", [])) or 20
         scenes_obj = payload.get("key_scenes", [])
         scenes = scenes_obj if isinstance(scenes_obj, list) else []
-        if len(scenes) != expected_scene_count:
-            issues.append(f"key_scenes 数量不匹配，当前 {len(scenes)}，期望 {expected_scene_count}")
+        if len(scenes) < min_scene_count or len(scenes) > max_scene_count:
+            issues.append(
+                f"key_scenes 数量不在范围内，当前 {len(scenes)}，期望 {min_scene_count}-{max_scene_count}"
+            )
 
         for index, scene in enumerate(scenes, start=1):
             if not isinstance(scene, dict):
@@ -747,8 +978,10 @@ class InfoCollector:
                     issues.append(f"scene {index} 的 {field} 过短，需至少18字")
             dialogues_obj = scene.get("sample_dialogue", [])
             dialogues = dialogues_obj if isinstance(dialogues_obj, list) else []
-            if len(dialogues) < 2 or not str(dialogues[0]).strip() or not str(dialogues[1]).strip():
-                issues.append(f"scene {index} 的 sample_dialogue 不满足2句中文对白")
+            sample_dialogue_count = getattr(conf, "SAMPLE_DIALOGUE_COUNT", 6)
+            valid_dialogues = [d for d in dialogues if str(d).strip()]
+            if len(valid_dialogues) < sample_dialogue_count:
+                issues.append(f"scene {index} 的 sample_dialogue 不足{sample_dialogue_count}句，当前{len(valid_dialogues)}句")
             breakdown = scene.get("importance_breakdown", {})
             if not isinstance(breakdown, dict):
                 issues.append(f"scene {index} 缺少 importance_breakdown 四维评分")
@@ -761,118 +994,119 @@ class InfoCollector:
             if len(score_reason) < 30:
                 issues.append(f"scene {index} 的 score_reason 过短，需至少30字说明打分依据")
 
+            subtitle_range = scene.get("subtitle_range", {})
+            if not isinstance(subtitle_range, dict):
+                issues.append(f"scene {index} 缺少 subtitle_range")
+                continue
+            start_index = subtitle_range.get("start_index")
+            end_index = subtitle_range.get("end_index")
+            if not isinstance(start_index, int) or not isinstance(end_index, int):
+                issues.append(f"scene {index} 的 subtitle_range 必须为整数索引")
+                continue
+            if start_index < 0 or end_index < start_index:
+                issues.append(f"scene {index} 的 subtitle_range 非法：start_index={start_index}, end_index={end_index}")
+
+            if index > 1:
+                prev_scene = scenes[index - 2] if isinstance(scenes[index - 2], dict) else {}
+                prev_range = prev_scene.get("subtitle_range", {}) if isinstance(prev_scene, dict) else {}
+                prev_end_index = prev_range.get("end_index") if isinstance(prev_range, dict) else None
+                if isinstance(prev_end_index, int) and start_index <= prev_end_index:
+                    issues.append(
+                        f"scene {index} 与前一场景字幕索引重叠：当前 start_index={start_index}, 前一场景 end_index={prev_end_index}"
+                    )
+
+            if index > 1:
+                prev_summary = str((scenes[index - 2] if isinstance(scenes[index - 2], dict) else {}).get("summary", "")).strip()
+                current_summary = str(scene.get("summary", "")).strip()
+                if prev_summary and current_summary and self._text_similarity(prev_summary, current_summary) >= 0.85:
+                    issues.append(f"scene {index - 1} 与 scene {index} summary 过于相似，需去重并推进剧情")
+
         return issues
 
+    def _text_similarity(self, left: str, right: str) -> float:
+        """简单字符级相似度，用于去重检查。"""
+        left_set = {ch for ch in left if not ch.isspace()}
+        right_set = {ch for ch in right if not ch.isspace()}
+        if not left_set or not right_set:
+            return 0.0
+        inter = len(left_set & right_set)
+        union = len(left_set | right_set)
+        if union == 0:
+            return 0.0
+        return inter / union
+
     def _match_timestamps(self, movie_info: dict[str, Any], subtitles: list[dict[str, Any]]) -> dict[str, Any]:
-        """为 key_scenes 匹配视频时间戳（整合自 add_keyscene_timestamps.py）"""
-        total_duration = subtitles[-1]["end"] if subtitles else 6926
-        logger.info("电影时长: %.1f 分钟，使用模糊匹配库: rapidfuzz", total_duration / 60)
+        """基于 LLM 给出的 subtitle_range 映射时间戳（严格单调且不重叠）。"""
+        if not subtitles:
+            return movie_info
 
-        results = []
-        prev_end = 0
+        min_interval = float(getattr(conf, "TIMESTAMP_MIN_INTERVAL", 30))
+        min_duration = float(getattr(conf, "TIMESTAMP_MIN_DURATION", 8))
+        total_duration = float(subtitles[-1].get("end", 0.0) or 0.0)
+        subtitle_count = len(subtitles)
 
-        for scene in movie_info.get("key_scenes", []):
-            unique_keywords = scene.get("unique_keywords", [])
-            if isinstance(unique_keywords, str):
-                unique_keywords = [unique_keywords]
+        scenes_obj = movie_info.get("key_scenes", [])
+        scenes = scenes_obj if isinstance(scenes_obj, list) else []
+        if not scenes:
+            return movie_info
 
-            interval = self._find_best_interval(unique_keywords, subtitles, prev_end=prev_end, window=120, threshold=75)
+        results: list[dict[str, Any]] = []
+        prev_end = 0.0
+        prev_index = -1
 
-            if interval:
-                start = interval["start"]
-                end = interval["end"]
-            else:
-                start = prev_end + 30
-                end = start + 120
+        for scene in scenes:
+            subtitle_range = scene.get("subtitle_range", {})
+            if not isinstance(subtitle_range, dict):
+                subtitle_range = {}
 
-            if end > total_duration:
-                end = total_duration
+            try:
+                start_idx = int(subtitle_range.get("start_index", prev_index + 1))
+            except (TypeError, ValueError):
+                start_idx = prev_index + 1
+            try:
+                end_idx = int(subtitle_range.get("end_index", start_idx))
+            except (TypeError, ValueError):
+                end_idx = start_idx
+
+            start_idx = max(start_idx, prev_index + 1, 0)
+            end_idx = max(end_idx, start_idx)
+            if subtitle_count > 0:
+                start_idx = min(start_idx, subtitle_count - 1)
+                end_idx = min(end_idx, subtitle_count - 1)
+
+            start = float(subtitles[start_idx].get("start", 0.0) or 0.0)
+            end = float(subtitles[end_idx].get("end", start + min_duration) or (start + min_duration))
+
+            if start < prev_end + min_interval:
+                start = prev_end + min_interval
+            if end <= start:
+                end = start + min_duration
+            if total_duration > 0:
+                end = min(end, total_duration)
+                if end <= start:
+                    start = max(0.0, end - min_duration)
 
             prev_end = end
+            prev_index = end_idx
 
+            scene["subtitle_range"] = {
+                "start_index": start_idx,
+                "end_index": end_idx,
+            }
             scene["video_clip"] = {
                 "start": round(start, 1),
                 "end": round(end, 1),
             }
             results.append(scene)
 
-            if interval:
-                logger.info("Scene %s: %.1fm - %.1fm (匹配%d个关键词, 相似度%.0f%%)",
-                           scene.get("scene_id"), start/60, end/60, interval["matched_keywords"], interval["score"])
-            else:
-                logger.info("Scene %s: %.1fm - %.1fm (顺序估算)", scene.get("scene_id"), start/60, end/60)
+            logger.info(
+                "Scene %s: %.1fm - %.1fm (sub %d-%d)",
+                scene.get("scene_id"),
+                start / 60,
+                end / 60,
+                start_idx,
+                end_idx,
+            )
 
         movie_info["key_scenes"] = results
         return movie_info
-
-    def _fuzzy_match(self, keyword: str, text: str, threshold: float = 75) -> float:
-        """模糊匹配关键词和文本"""
-        score = fuzz.partial_ratio(keyword, text)
-        return score if score >= threshold else 0
-
-    def _find_best_match(self, keyword: str, subtitles: list[dict[str, Any]], threshold: float = 75) -> list[dict[str, Any]]:
-        """找关键词在字幕中的最佳匹配"""
-        if not keyword or not subtitles:
-            return []
-
-        matches = []
-        for sub in subtitles:
-            text = sub.get("text", "")
-            score = self._fuzzy_match(keyword, text, threshold)
-            if score > 0:
-                matches.append({
-                    "start": sub["start"],
-                    "end": sub["end"],
-                    "text": text[:50],
-                    "keyword": keyword,
-                    "score": score
-                })
-        return matches
-
-    def _find_best_interval(self, keywords: list, subtitles: list, prev_end: float = 0,
-                           window: float = 120, threshold: float = 75) -> dict | None:
-        """多关键词区间评分，找到最佳时间区间"""
-        if not keywords:
-            return None
-
-        all_matches = []
-        for kw in keywords:
-            matches = self._find_best_match(kw, subtitles, threshold)
-            all_matches.append({"keyword": kw, "matches": matches})
-
-        valid_keyword_count = sum(1 for m in all_matches if m["matches"])
-        if valid_keyword_count == 0:
-            return None
-
-        centers = []
-        for m in all_matches:
-            if m["matches"]:
-                best = max(m["matches"], key=lambda x: x["score"])
-                center = (best["start"] + best["end"]) / 2
-                centers.append({"center": center, "score": best["score"]})
-
-        if not centers:
-            return None
-
-        avg_center = sum(c["center"] for c in centers) / len(centers)
-        avg_score = sum(c["score"] for c in centers) / len(centers)
-
-        interval_start = max(0, avg_center - window)
-        interval_end = avg_center + window
-
-        original_start = interval_start
-        original_end = interval_end
-
-        if interval_start < prev_end + 30:
-            interval_start = prev_end + 30
-            interval_end = interval_start + (original_end - original_start)
-
-        actual_center = (interval_start + interval_end) / 2
-
-        return {
-            "start": interval_start,
-            "end": interval_end,
-            "center": actual_center,
-            "score": avg_score,
-            "matched_keywords": valid_keyword_count
-        }

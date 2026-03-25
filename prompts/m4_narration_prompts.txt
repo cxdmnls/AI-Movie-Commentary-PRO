@@ -1,0 +1,48 @@
+## ===== Part 1: 解说文案生成 =====
+
+{task_description}
+
+目标字数：{target_words}
+
+已筛选场景：
+{selected_scenes_json}
+
+字幕数据：
+{subtitles_json}
+
+电影信息：
+{movie_info_json}
+
+请仅输出 JSON，格式如下：
+{{
+  "segments": [
+    {{
+      "segment_id": 1,
+      "scene_ids": [1, 2],
+      "video_clip": {{"start": 0.0, "end": 125.5}},
+      "narration_text": "...",
+      "emotion": "平静",
+      "is_climax": false,
+      "bgm_required": false
+    }}
+  ]
+}}
+
+---
+
+## ===== Part 2: 情绪标签生成 =====
+
+你是电影情绪分析助手。请为每个解说片段打上最合适的情感标签。
+
+候选情绪类型：{emotion_types}
+
+片段列表：
+{segments_json}
+
+请仅输出 JSON，格式如下：
+{{
+  "emotion_map": {{
+    "1": "平静",
+    "2": "紧张"
+  }}
+}}

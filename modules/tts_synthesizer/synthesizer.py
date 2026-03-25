@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +24,23 @@ class TTSSynthesizer:
         self.model: Any | None = None
         self._model_error: Exception | None = None
 
+        # Workaround for duplicated OpenMP runtime on Windows envs.
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+        # Prefer local cloned CosyVoice repo if available.
+        local_cosyvoice_repo = Path(r"E:\Develop\third_party\CosyVoice")
+        if local_cosyvoice_repo.exists() and str(local_cosyvoice_repo) not in sys.path:
+            sys.path.insert(0, str(local_cosyvoice_repo))
+
+        # Ensure Matcha-TTS submodule is importable without editable install.
+        local_matcha_repo = local_cosyvoice_repo / "third_party" / "Matcha-TTS"
+        if local_matcha_repo.exists() and str(local_matcha_repo) not in sys.path:
+            sys.path.insert(0, str(local_matcha_repo))
+
         try:
-            from cosyvoice.cli.cosyvoice import CosyVoice  # type: ignore
+            from cosyvoice.cli.cosyvoice import CosyVoice, CosyVoice2  # type: ignore
+            import cosyvoice.cli.frontend as cosy_frontend  # type: ignore
+            import cosyvoice.utils.file_utils as cosy_file_utils  # type: ignore
         except ImportError as exc:
             self._model_error = exc
             logger.warning(
@@ -31,13 +48,46 @@ class TTSSynthesizer:
             )
             return
 
+        # Work around torchaudio.load -> torchcodec dependency issues on Windows.
+        # CosyVoice frontend imports `load_wav` from file_utils at module import time,
+        # so we patch both references here.
+        try:
+            import librosa  # type: ignore
+            import numpy as np
+            import soundfile as sf  # type: ignore
+            import torch
+
+            def _safe_load_wav(wav: str, target_sr: int, min_sr: int = 16000):
+                speech, sample_rate = sf.read(wav, dtype="float32", always_2d=False)
+                if isinstance(speech, np.ndarray) and speech.ndim > 1:
+                    speech = speech.mean(axis=1)
+                if not isinstance(speech, np.ndarray):
+                    speech = np.asarray(speech, dtype=np.float32)
+                if sample_rate != target_sr:
+                    assert sample_rate >= min_sr, (
+                        f"wav sample rate {sample_rate} must be greater than {min_sr}"
+                    )
+                    speech = librosa.resample(speech, orig_sr=sample_rate, target_sr=target_sr)
+                tensor = torch.tensor(speech, dtype=torch.float32).unsqueeze(0)
+                return tensor
+
+            cosy_file_utils.load_wav = _safe_load_wav
+            cosy_frontend.load_wav = _safe_load_wav
+        except Exception as exc:  # pragma: no cover - best effort fallback
+            logger.warning("替换 CosyVoice load_wav 失败，继续使用默认实现: %s", exc)
+
         model_path = Path(conf.COSYVOICE_MODEL_PATH)
         if not model_path.exists():
             logger.warning("CosyVoice 模型路径不存在: %s", model_path)
 
         logger.info("加载 CosyVoice 模型: path=%s, device=%s", model_path, conf.TTS_DEVICE)
         try:
-            self.model = CosyVoice(str(model_path), device=conf.TTS_DEVICE)
+            # CosyVoice 官方接口会自动依据 torch.cuda.is_available() 选择设备。
+            # 若目录是 CosyVoice2 模型，优先使用 CosyVoice2 初始化。
+            if (model_path / "cosyvoice2.yaml").exists():
+                self.model = CosyVoice2(str(model_path))
+            else:
+                self.model = CosyVoice(str(model_path))
         except (RuntimeError, OSError, ValueError) as exc:
             self._model_error = exc
             logger.error("CosyVoice 模型加载失败: %s", exc)
@@ -61,16 +111,32 @@ class TTSSynthesizer:
 
         logger.info("开始 TTS 合成: output=%s, speed=%.3f", output_file, target_speed)
         try:
-            generation = self.model.inference_zero_shot(
-                text,
-                str(voice_ref_path),
-                stream=False,
-            )
+            if hasattr(self.model, "inference_cross_lingual"):
+                generation = self.model.inference_cross_lingual(
+                    text,
+                    str(voice_ref_path),
+                    stream=False,
+                    speed=target_speed,
+                )
+            else:
+                generation = self.model.inference_zero_shot(
+                    text,
+                    "",
+                    str(voice_ref_path),
+                    stream=False,
+                    speed=target_speed,
+                )
         except TypeError:
-            generation = self.model.inference_zero_shot(text, str(voice_ref_path))
+            if hasattr(self.model, "inference_cross_lingual"):
+                generation = self.model.inference_cross_lingual(text, str(voice_ref_path))
+            else:
+                generation = self.model.inference_zero_shot(text, "", str(voice_ref_path))
         except (RuntimeError, ValueError) as exc:
             logger.error("CosyVoice 推理失败: %s", exc)
             raise RuntimeError(f"TTS 推理失败: {exc}") from exc
+
+        if not isinstance(generation, (str, dict, list, tuple)) and hasattr(generation, "__iter__"):
+            generation = list(generation)
 
         raw_audio_path = self._save_generated_audio(generation, output_file)
         if abs(target_speed - 1.0) > 1e-4:
@@ -211,9 +277,8 @@ class TTSSynthesizer:
 
         try:
             import torch
-            import torchaudio
         except ImportError as exc:
-            raise RuntimeError("保存波形需要 torch 与 torchaudio 依赖") from exc
+            raise RuntimeError("保存波形需要 torch 依赖") from exc
 
         tensor = waveform
         if not isinstance(tensor, torch.Tensor):
@@ -221,7 +286,24 @@ class TTSSynthesizer:
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(0)
 
-        torchaudio.save(str(output_path), tensor.cpu(), conf.TTS_SAMPLE_RATE)
+        tensor = tensor.cpu()
+
+        # Prefer soundfile to avoid torchaudio's torchcodec runtime requirement.
+        try:
+            import soundfile as sf  # type: ignore
+
+            np_audio = tensor.squeeze(0).numpy()
+            sf.write(str(output_path), np_audio, conf.TTS_SAMPLE_RATE)
+            return output_path
+        except Exception:
+            pass
+
+        try:
+            import torchaudio  # type: ignore
+
+            torchaudio.save(str(output_path), tensor, conf.TTS_SAMPLE_RATE)
+        except Exception as exc:
+            raise RuntimeError(f"保存波形失败: {exc}") from exc
         return output_path
 
     @staticmethod

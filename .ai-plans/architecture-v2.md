@@ -22,16 +22,17 @@
 
 **模式 B：关键场景模式（`run_keyscene` 命令）**
 - 基于 LLM 多轮质量校验的剧情关键点生成（整合自 `regenerate_movie_info_with_qwen.py`）
-- 通过 unique_keywords 模糊匹配字幕计算时间戳（整合自 `add_keyscene_timestamps.py`）
+- 支持“代码联网抓取 + Qwen 归纳”关键词增强检索
+- 时间戳由字幕语义匹配自动计算（优先使用外部 SRT，缺失时回退 M1 字幕提取）
 - 适合"精选片段"型解说视频
 
 ## 2. 当前能力总览
 
 - M1 字幕提取：faster-whisper，本地转录；不可用时自动降级占位字幕。
 - M2 场景检测：PySceneDetect + 缩略图导出；不可用时按固定时长切分。
-- M3 信息采集：豆瓣/百科/TMDb/IMDb-OMDb 聚合，可选 Qwen 结构化增强。
+- M3 信息采集：豆瓣/百科/TMDb/IMDb-OMDb 聚合 + 关键词联网检索上下文，可选 Qwen 结构化增强。
   - **标准模式**：简化增强，生成基础 key_scenes
-  - **关键场景模式**：完整剧情结构，生成 20 个关键场景，包含 unique_keywords
+  - **关键场景模式**：完整剧情结构，场景数量由模型评估（代码约束 10-20）
 - M4 剧本生成：Qwen 三轮生成（场景筛选/解说生成/情感标注）；失败时可降级生成最小可执行脚本。
   - **标准模式**：M4 执行完整三轮生成
   - **关键场景模式**：Step 3.5 导出 Markdown 剧本，Step 4 转换为标准 script.json
@@ -42,8 +43,8 @@
 - 审核流程：CLI 交互审核（reviewer）+ Gradio JSON 可编辑审核。
   - **标准模式**：审核点1（M4后）+ 审核点2（M5-M7后）
   - **关键场景模式**：审核点1（M4后）+ 审核点2（M5-M7后）
-- **关键场景生成**：M3 支持生成完整的剧情关键场景（20个），包含剧情结构、角色分析、时间戳匹配。
-- **时间戳匹配**：基于 unique_keywords 模糊匹配字幕，自动计算 video_clip 时间戳。
+- **关键场景生成**：M3 支持生成完整剧情关键场景（模型评估 10-20），包含剧情结构、角色分析、时间戳匹配。
+- **时间戳匹配**：基于 Qwen 输出的 `subtitle_range` 映射 SRT 时间戳，代码强制单调且不重叠。
 - **剧本导出**：支持导出 Markdown 格式的人类可读剧本（Step 3.5）。
 
 ## 3. 主流程（代码实际编排）
@@ -84,6 +85,14 @@ python main.py run_keyscene <video> --name <name> --stop-at 3
 # 完整流程（需要 voice）
 python main.py run_keyscene <video> --name <name> --voice <voice> --stop-at 8
 
+# 指定 SRT + 关键词（推荐）
+python main.py run_keyscene <video> --name <name> \
+  --srt <path/to/subtitle.srt> \
+  --keywords "关键词1,关键词2,关键词3"
+
+# 关键词文件（一行一个）
+python main.py run_keyscene <video> --name <name> --keywords-file <path/to/keywords.txt>
+
 # 跳过时间戳匹配
 python main.py run_keyscene <video> --name <name> --skip-timestamp-match
 ```
@@ -92,10 +101,13 @@ python main.py run_keyscene <video> --name <name> --skip-timestamp-match
 - `video`: 电影文件路径
 - `--name, -n`: 电影名称（**必需**）
 - `--voice, -v`: 参考音频路径（**step >= 5 必需**）
+- `--srt`: 外部 SRT 字幕路径（用于关键场景时间戳，优先级最高）
+- `--keywords`: 关键词列表（逗号分隔，用于联网检索）
+- `--keywords-file`: 关键词文件（一行一个，和 `--keywords` 合并去重）
 - `--stop-at, -s`: 停止步骤（默认: 4）
   - `1` = 初始化（创建 workspace）
   - `2` = 预处理（字幕+场景检测）
-  - `3` = M3 信息采集（生成 20 个关键场景）
+  - `3` = M3 信息采集（生成关键场景，模型评估 10-20）
   - `4` = 导出可读剧本 + 转换格式（默认，生成 Markdown + JSON）
   - `5` = M5-M7 素材生产（需要 `--voice`）
   - `6` = 素材审核
@@ -107,7 +119,7 @@ python main.py run_keyscene <video> --name <name> --skip-timestamp-match
 ```text
 Step 1  初始化 workspace
 Step 2  M1 字幕提取 + M2 场景检测（并行）
-Step 3  M3 关键场景生成（20个）+ 时间戳匹配
+Step 3  M3 关键场景生成（模型评估 10-20）+ 时间戳匹配
 Step 3.5 导出可读剧本（Markdown）
 Step 4  转换关键场景为标准 script.json
 Step 5  并行生产（M5 TTS + M6 BGM + M7 视频裁切）
@@ -205,23 +217,23 @@ python main.py export-script <workspace_path> --output <output_path>
 
 **模式 B：关键场景模式（`collect(keyscene_mode=True)`）**
 - 使用 `_enrich_with_llm_v2()` 方法（整合自 `regenerate_movie_info_with_qwen.py`）生成完整剧情结构
-- 生成 20 个关键场景（`M3_KEYSCENE_COUNT` 可配置）
+- 场景数由 Qwen 自动评估，受代码约束在 **10-20** 区间（默认）
 - 每个场景包含：
   - 基础信息：`scene_id`, `phase`, `summary`, `importance`, `suggested_emotion`
   - 剧情要素：`scene_goal`, `conflict`, `turning_point`, `location`
-  - 执行信息：`characters_present`, `visual_tone`, `dialogue_focus`, `action_line`
-  - 关键词：`unique_keywords`（用于字幕匹配）
-  - 对话：`sample_dialogue`（2句示例对白）
-  - 元数据：`score_reason`
+- 执行信息：`characters_present`, `visual_tone`, `dialogue_focus`, `action_line`
+- 对话：`sample_dialogue`（可配置，默认 6 句）
+- 时间定位：`subtitle_range.start_index/end_index`
+- 元数据：`score_reason`
 - 质量保障：
   - 自动质量校验（`_assess_quality_v2`）
   - 多轮自动修正（max 3 rounds）
   - 递归清理来源字段
 
 **时间戳匹配（`_match_timestamps()`）**
-- 功能：基于 `unique_keywords` 模糊匹配字幕，计算 `video_clip` 时间戳（整合自 `add_keyscene_timestamps.py`）
-- 依赖：`rapidfuzz` 库（优先）或 `difflib`（降级）
-- 算法：多关键词匹配 → 计算时间中心 → 前后扩展窗口 → 确保最小间隔
+- 功能：将 `subtitle_range` 直接映射到 SRT 时间，生成 `video_clip` 时间戳
+- 约束：按 scene_id 顺序单调推进，强制不重叠，最小间隔由配置控制
+- 字幕来源优先级：`--srt` 指定文件 > `workspace/<电影名>.srt` > M1 自动提取字幕
 
 ### M4 剧本生成（`modules/script_generator/generator.py`）
 
@@ -280,7 +292,7 @@ Movie/
 ├── main.py                          # CLI 主入口（支持 run/run_keyscene/resume/export-script）
 ├── gradio_app.py                    # Gradio Web 界面
 ├── conf.py                          # 全局配置（含关键场景模式配置）
-├── requirements.txt                 # 依赖（新增 rapidfuzz）
+├── requirements.txt                 # 依赖
 ├── prompts/                         # Prompt 模板（位于项目根目录）
 │   ├── plot_enhancement.txt
 │   ├── narration_gen.txt
