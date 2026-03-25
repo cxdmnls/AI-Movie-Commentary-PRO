@@ -12,6 +12,7 @@
 9) 【关键约束】sample_dialogue 必须严格从该 scene 的 video_clip 时间范围内的字幕中选取，每句台词的每个字都必须在这个时间范围内出现过。不允许选取范围外的台词！！！
 10) phase 必须为以下之一：setup, inciting_incident, rising_action, midpoint, climax, resolution。
 11) 【必须自检】输出前验证：每个 scene 的每句 sample_dialogue 都必须能在该 scene 的 video_clip 时间范围内的字幕文本中找到。如果找不到，必须替换为范围内能找到的台词。
+12) 每个 scene 的 video_clip 时长建议控制在 8-15 分钟以内，不要出现时长过长或过短的场景。
 
 字幕原文（SRT 解析结果，包含 start/end/text）：
 {subtitles_json}
