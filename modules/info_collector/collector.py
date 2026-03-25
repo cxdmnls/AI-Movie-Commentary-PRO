@@ -136,11 +136,10 @@ class InfoCollector:
             subtitles=subtitles or [],
         )
 
-        if subtitles:
-            logger.info("自动匹配时间戳...")
-            merged = self._match_timestamps(merged, subtitles)
+        for field in ("title", "year", "genre", "synopsis", "characters"):
+            merged.pop(field, None)
 
-        logger.info("信息采集完成: title=%s", merged.get("title"))
+        logger.info("信息采集完成: key_scenes count=%d", len(merged.get("key_scenes", [])))
         return merged
 
     def _estimate_scene_count(
@@ -673,65 +672,19 @@ class InfoCollector:
     ) -> list[dict[str, str]]:
         """构建初始 LLM 消息"""
         sample_dialogue_count = getattr(conf, "SAMPLE_DIALOGUE_COUNT", 6)
-        importance_criteria = _load_prompt("importance_criteria")
         output_schema = {
-            "title": "string",
-            "year": "int",
-            "genre": ["string"],
-            "synopsis": "string",
-            "characters": [
-                {"name": "string", "role": "string", "motivation": "string"}
-            ],
-            "plot_structure": {
-                "setup": "string",
-                "inciting_incident": "string",
-                "rising_action": "string",
-                "midpoint": "string",
-                "climax": "string",
-                "resolution": "string",
-            },
-            "chapter_breakdown": [
-                {
-                    "chapter_id": "int",
-                    "phase": "string",
-                    "title": "string",
-                    "core_goal": "string",
-                    "main_conflict": "string",
-                    "plot_progress": "string",
-                    "emotional_shift": "string",
-                    "stakes": "string",
-                }
-            ],
             "key_scenes": [
                 {
                     "scene_id": "int",
                     "phase": "string",
                     "summary": "string",
-                    "subtitle_range": {
-                        "start_index": "int",
-                        "end_index": "int",
-                    },
-                    "importance_breakdown": {
-                        "plot_advancement": "int",
-                        "emotional_impact": "int",
-                        "turning_point": "int",
-                        "character_development": "int",
-                    },
-                    "suggested_emotion": "string",
-                    "location": "string",
-                    "characters_present": ["string"],
-                    "scene_goal": "string",
-                    "conflict": "string",
-                    "turning_point": "string",
-                    "visual_tone": "string",
-                    "dialogue_focus": "string",
-                    "action_line": "string",
                     "sample_dialogue": ["string"],
-                    "score_reason": "string",
+                    "video_clip": {
+                        "start": "string",
+                        "end": "string"
+                    }
                 }
-            ],
-            "emotional_arc": [{"stage": "string", "emotion": "string"}],
-            "usage_notes": ["string"],
+            ]
         }
 
         prompt = _load_prompt(
@@ -741,9 +694,7 @@ class InfoCollector:
             max_scene_count=max_scene_count,
             target_scene_count=target_scene_count,
             sample_dialogue_count=sample_dialogue_count,
-            importance_criteria=importance_criteria,
             search_context_json=json.dumps(search_context, ensure_ascii=False, indent=2),
-            seed_json=json.dumps(seed, ensure_ascii=False, indent=2),
             subtitles_json=json.dumps(subtitles, ensure_ascii=False, indent=2),
             output_schema_json=json.dumps(output_schema, ensure_ascii=False, indent=2),
             issues_json="[]",
@@ -768,7 +719,6 @@ class InfoCollector:
     ) -> list[dict[str, str]]:
         """构建修复消息"""
         sample_dialogue_count = getattr(conf, "SAMPLE_DIALOGUE_COUNT", 6)
-        importance_criteria = _load_prompt("importance_criteria")
         prompt = _load_prompt(
             "m3_keyscene",
             mode="revision",
@@ -776,11 +726,9 @@ class InfoCollector:
             max_scene_count=max_scene_count,
             target_scene_count=target_scene_count,
             sample_dialogue_count=sample_dialogue_count,
-            importance_criteria=importance_criteria,
             output_schema_json="{}",
             issues_json=json.dumps(issues, ensure_ascii=False, indent=2),
             search_context_json=json.dumps(search_context, ensure_ascii=False, indent=2),
-            seed_json=json.dumps(seed, ensure_ascii=False, indent=2),
             subtitles_json=json.dumps(subtitles, ensure_ascii=False, indent=2),
             draft_json=json.dumps(draft, ensure_ascii=False, indent=2),
         )
@@ -841,7 +789,7 @@ class InfoCollector:
         max_scene_count: int,
         target_scene_count: int,
     ) -> dict[str, Any]:
-        """标准化 LLM 输出（整合自 regenerate_movie_info_with_qwen.py）"""
+        """标准化 LLM 输出"""
         scenes_obj = result.get("key_scenes", [])
         scenes_list = scenes_obj if isinstance(scenes_obj, list) else []
         proposed_count = len(scenes_list) if scenes_list else target_scene_count
@@ -849,11 +797,6 @@ class InfoCollector:
         expected_ids = list(range(1, scene_count + 1))
 
         payload = {
-            "title": str(result.get("title", seed.get("title", ""))),
-            "year": int(result.get("year", seed.get("year", 0)) or 0),
-            "genre": result.get("genre", seed.get("genre", [])),
-            "synopsis": str(result.get("synopsis", "")),
-            "characters": result.get("characters", []),
             "key_scenes": self._normalize_scenes_v2(result.get("key_scenes") or [], expected_ids),
         }
 
@@ -874,25 +817,6 @@ class InfoCollector:
         for scene_id in expected_ids:
             source = by_id.get(scene_id, {"scene_id": scene_id})
 
-            breakdown_raw = source.get("importance_breakdown", {})
-            if not isinstance(breakdown_raw, dict):
-                breakdown_raw = {}
-            importance_breakdown = {
-                "plot_advancement": max(1, min(10, int(breakdown_raw.get("plot_advancement", 6)))),
-                "emotional_impact": max(1, min(10, int(breakdown_raw.get("emotional_impact", 6)))),
-                "turning_point": max(1, min(10, int(breakdown_raw.get("turning_point", 6)))),
-                "character_development": max(1, min(10, int(breakdown_raw.get("character_development", 6)))),
-            }
-
-            importance = (
-                importance_breakdown["plot_advancement"] * 0.3 +
-                importance_breakdown["emotional_impact"] * 0.25 +
-                importance_breakdown["turning_point"] * 0.25 +
-                importance_breakdown["character_development"] * 0.2
-            )
-            importance = round(importance, 1)
-            importance = max(1.0, min(10.0, importance))
-
             sample_dialogue_count = getattr(conf, "SAMPLE_DIALOGUE_COUNT", 6)
             raw_dialogue = source.get("sample_dialogue", [])
             if not isinstance(raw_dialogue, list):
@@ -901,51 +825,23 @@ class InfoCollector:
             while len(sample_dialogue) < sample_dialogue_count:
                 sample_dialogue.append("")
 
-            raw_chars = source.get("characters_present", [])
-            if not isinstance(raw_chars, list):
-                raw_chars = []
+            video_clip_raw = source.get("video_clip", {})
+            if not isinstance(video_clip_raw, dict):
+                video_clip_raw = {}
 
             normalized.append(
                 {
                     "scene_id": scene_id,
                     "phase": str(source.get("phase", "")).strip(),
                     "summary": str(source.get("summary", "")).strip(),
-                    "subtitle_range": self._normalize_subtitle_range(source.get("subtitle_range", {})),
-                    "importance": importance,
-                    "importance_breakdown": importance_breakdown,
-                    "suggested_emotion": str(source.get("suggested_emotion", "")).strip(),
-                    "location": str(source.get("location", "")).strip(),
-                    "characters_present": [str(ch).strip() for ch in raw_chars if str(ch).strip()],
-                    "scene_goal": str(source.get("scene_goal", "")).strip(),
-                    "conflict": str(source.get("conflict", "")).strip(),
-                    "turning_point": str(source.get("turning_point", "")).strip(),
-                    "visual_tone": str(source.get("visual_tone", "")).strip(),
-                    "dialogue_focus": str(source.get("dialogue_focus", "")).strip(),
-                    "action_line": str(source.get("action_line", "")).strip(),
                     "sample_dialogue": sample_dialogue,
-                    "score_reason": str(source.get("score_reason", "")).strip(),
+                    "video_clip": {
+                        "start": str(video_clip_raw.get("start", "00:00:00.0")).strip(),
+                        "end": str(video_clip_raw.get("end", "00:00:00.0")).strip(),
+                    },
                 }
             )
         return normalized
-
-    def _normalize_subtitle_range(self, value: Any) -> dict[str, int]:
-        """标准化 subtitle_range，确保字段存在。"""
-        if not isinstance(value, dict):
-            value = {}
-
-        try:
-            start_index = int(value.get("start_index", -1))
-        except (TypeError, ValueError):
-            start_index = -1
-        try:
-            end_index = int(value.get("end_index", -1))
-        except (TypeError, ValueError):
-            end_index = -1
-
-        return {
-            "start_index": start_index,
-            "end_index": end_index,
-        }
 
     def _assess_quality_v2(
         self,
@@ -956,10 +852,6 @@ class InfoCollector:
     ) -> list[str]:
         """评估输出质量并返回问题列表"""
         issues: list[str] = []
-
-        synopsis_len = len(str(payload.get("synopsis", "")).strip())
-        if synopsis_len < 900:
-            issues.append(f"synopsis 过短，当前约 {synopsis_len} 字，需扩展至 900-1200 字")
 
         scenes_obj = payload.get("key_scenes", [])
         scenes = scenes_obj if isinstance(scenes_obj, list) else []
@@ -972,48 +864,36 @@ class InfoCollector:
             if not isinstance(scene, dict):
                 issues.append(f"scene {index} 结构非法")
                 continue
-            for field in ["summary", "scene_goal", "conflict", "turning_point"]:
-                text = str(scene.get(field, "")).strip()
-                if len(text) < 18:
-                    issues.append(f"scene {index} 的 {field} 过短，需至少18字")
+
+            summary = str(scene.get("summary", "")).strip()
+            if len(summary) < 18:
+                issues.append(f"scene {index} 的 summary 过短，需至少18字")
+
             dialogues_obj = scene.get("sample_dialogue", [])
             dialogues = dialogues_obj if isinstance(dialogues_obj, list) else []
             sample_dialogue_count = getattr(conf, "SAMPLE_DIALOGUE_COUNT", 6)
             valid_dialogues = [d for d in dialogues if str(d).strip()]
             if len(valid_dialogues) < sample_dialogue_count:
                 issues.append(f"scene {index} 的 sample_dialogue 不足{sample_dialogue_count}句，当前{len(valid_dialogues)}句")
-            breakdown = scene.get("importance_breakdown", {})
-            if not isinstance(breakdown, dict):
-                issues.append(f"scene {index} 缺少 importance_breakdown 四维评分")
-            else:
-                required_dims = ["plot_advancement", "emotional_impact", "turning_point", "character_development"]
-                for dim in required_dims:
-                    if dim not in breakdown:
-                        issues.append(f"scene {index} 缺少 {dim} 维度评分")
-            score_reason = str(scene.get("score_reason", "")).strip()
-            if len(score_reason) < 30:
-                issues.append(f"scene {index} 的 score_reason 过短，需至少30字说明打分依据")
 
-            subtitle_range = scene.get("subtitle_range", {})
-            if not isinstance(subtitle_range, dict):
-                issues.append(f"scene {index} 缺少 subtitle_range")
+            video_clip = scene.get("video_clip", {})
+            if not isinstance(video_clip, dict):
+                issues.append(f"scene {index} 缺少 video_clip")
                 continue
-            start_index = subtitle_range.get("start_index")
-            end_index = subtitle_range.get("end_index")
-            if not isinstance(start_index, int) or not isinstance(end_index, int):
-                issues.append(f"scene {index} 的 subtitle_range 必须为整数索引")
-                continue
-            if start_index < 0 or end_index < start_index:
-                issues.append(f"scene {index} 的 subtitle_range 非法：start_index={start_index}, end_index={end_index}")
+
+            start: str = video_clip.get("start", "")
+            end: str = video_clip.get("end", "")
+            if not isinstance(start, str) or not isinstance(end, str):
+                issues.append(f"scene {index} 的 video_clip.start/end 必须为字符串格式")
+            elif not re.match(r"\d{2}:\d{2}:\d{2}\.\d", start) or not re.match(r"\d{2}:\d{2}:\d{2}\.\d", end):
+                issues.append(f"scene {index} 的 video_clip 格式错误，应为 HH:MM:SS.m 格式")
 
             if index > 1:
                 prev_scene = scenes[index - 2] if isinstance(scenes[index - 2], dict) else {}
-                prev_range = prev_scene.get("subtitle_range", {}) if isinstance(prev_scene, dict) else {}
-                prev_end_index = prev_range.get("end_index") if isinstance(prev_range, dict) else None
-                if isinstance(prev_end_index, int) and start_index <= prev_end_index:
-                    issues.append(
-                        f"scene {index} 与前一场景字幕索引重叠：当前 start_index={start_index}, 前一场景 end_index={prev_end_index}"
-                    )
+                prev_clip = prev_scene.get("video_clip", {}) if isinstance(prev_scene, dict) else {}
+                prev_end = prev_clip.get("end", "") if isinstance(prev_clip, dict) else ""
+                if start and prev_end and start <= prev_end:
+                    issues.append(f"scene {index} 时间戳不递增：当前 start={start}, 前一 end={prev_end}")
 
             if index > 1:
                 prev_summary = str((scenes[index - 2] if isinstance(scenes[index - 2], dict) else {}).get("summary", "")).strip()
@@ -1034,79 +914,3 @@ class InfoCollector:
         if union == 0:
             return 0.0
         return inter / union
-
-    def _match_timestamps(self, movie_info: dict[str, Any], subtitles: list[dict[str, Any]]) -> dict[str, Any]:
-        """基于 LLM 给出的 subtitle_range 映射时间戳（严格单调且不重叠）。"""
-        if not subtitles:
-            return movie_info
-
-        min_interval = float(getattr(conf, "TIMESTAMP_MIN_INTERVAL", 30))
-        min_duration = float(getattr(conf, "TIMESTAMP_MIN_DURATION", 8))
-        total_duration = float(subtitles[-1].get("end", 0.0) or 0.0)
-        subtitle_count = len(subtitles)
-
-        scenes_obj = movie_info.get("key_scenes", [])
-        scenes = scenes_obj if isinstance(scenes_obj, list) else []
-        if not scenes:
-            return movie_info
-
-        results: list[dict[str, Any]] = []
-        prev_end = 0.0
-        prev_index = -1
-
-        for scene in scenes:
-            subtitle_range = scene.get("subtitle_range", {})
-            if not isinstance(subtitle_range, dict):
-                subtitle_range = {}
-
-            try:
-                start_idx = int(subtitle_range.get("start_index", prev_index + 1))
-            except (TypeError, ValueError):
-                start_idx = prev_index + 1
-            try:
-                end_idx = int(subtitle_range.get("end_index", start_idx))
-            except (TypeError, ValueError):
-                end_idx = start_idx
-
-            start_idx = max(start_idx, prev_index + 1, 0)
-            end_idx = max(end_idx, start_idx)
-            if subtitle_count > 0:
-                start_idx = min(start_idx, subtitle_count - 1)
-                end_idx = min(end_idx, subtitle_count - 1)
-
-            start = float(subtitles[start_idx].get("start", 0.0) or 0.0)
-            end = float(subtitles[end_idx].get("end", start + min_duration) or (start + min_duration))
-
-            if start < prev_end + min_interval:
-                start = prev_end + min_interval
-            if end <= start:
-                end = start + min_duration
-            if total_duration > 0:
-                end = min(end, total_duration)
-                if end <= start:
-                    start = max(0.0, end - min_duration)
-
-            prev_end = end
-            prev_index = end_idx
-
-            scene["subtitle_range"] = {
-                "start_index": start_idx,
-                "end_index": end_idx,
-            }
-            scene["video_clip"] = {
-                "start": round(start, 1),
-                "end": round(end, 1),
-            }
-            results.append(scene)
-
-            logger.info(
-                "Scene %s: %.1fm - %.1fm (sub %d-%d)",
-                scene.get("scene_id"),
-                start / 60,
-                end / 60,
-                start_idx,
-                end_idx,
-            )
-
-        movie_info["key_scenes"] = results
-        return movie_info

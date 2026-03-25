@@ -4,33 +4,14 @@
 1) 必须输出严格 JSON，不得输出任何解释文字。
 2) key_scenes 场景数量必须在 {min_scene_count}-{max_scene_count} 之间，并尽量接近 {target_scene_count}。
 3) scene_id 必须从 1 开始连续递增。
-4) 每个场景必须输出 subtitle_range，且 start_index/end_index 为整数。
-5) subtitle_range 必须严格按剧情顺序单调递增：后一个场景的 start_index 必须大于前一个场景的 end_index。
-6) 场景叙事必须按时间推进，禁止把同一事件拆成重复场景；相邻场景 summary 必须有明显差异。
-7) importance_breakdown 必须包含 plot_advancement/emotional_impact/turning_point/character_development 四个维度，且各为 1-10 整数。
-8) importance 由代码按 importance_breakdown 加权计算，importance 字段可省略或任意值。
-9) score_reason 必须详细说明每个维度的打分依据，不少于 30 字。
-10) synopsis 必须是 900-1200 字中文完整剧情梳理，按时间推进覆盖开端-发展-转折-高潮-结局。
-11) chapter_breakdown 必须覆盖 6 个 phase: setup, inciting_incident, rising_action, midpoint, climax, resolution。
-12) sample_dialogue 必须是 {sample_dialogue_count} 句高辨识度中文对白，优先经典台词或高情感张力对白，格式为“角色名：对白内容”。
-13) key_scenes 每一项都必须细化：summary/scene_goal/conflict/turning_point 至少 18 字，action_line 至少 12 字。
-14) 禁止虚构未被证据支持的具体事实；不确定的信息使用空字符串或空数组。
-15) 禁止输出 generated_by、importance_source、details_source、content_generated_by、generation_method 等来源标记字段。
-
-场景重要性评分标准：
-{importance_criteria}
-
-待修复问题列表（mode=initial 时可忽略）：
-{issues_json}
-
-联网检索上下文（代码抓取结果）：
-{search_context_json}
-
-基础输入（seed）：
-{seed_json}
-
-当前草稿（mode=revision 时重点参考）：
-{draft_json}
+4) video_clip.start/end 必须为 "HH:MM:SS.m" 格式（如 "00:01:35.6"），精确到 0.1 秒。
+5) 场景时间戳必须严格按时间顺序单调递增，后一个场景的 start 必须大于前一个场景的 end。
+6) 场景划分规则：先将电影按时间顺序划分为 N 个连续不重叠的时间段（每个 scene 的 video_clip.start 必须等于上一个 scene 的 video_clip.end 或更晚），再为每个时间段匹配对应的 summary。video_clip.start 必须是该时间段内第一条字幕的实际时间，video_clip.end 必须是最后一条字幕的实际时间。
+7) 禁止直接把字幕均分，必须按实际剧情话题转换点划分场景。
+8) scene 的 summary 必须能体现该时间段内的核心剧情事件。
+9) 【关键约束】sample_dialogue 必须严格从该 scene 的 video_clip 时间范围内的字幕中选取，每句台词的每个字都必须在这个时间范围内出现过。不允许选取范围外的台词！！！
+10) phase 必须为以下之一：setup, inciting_incident, rising_action, midpoint, climax, resolution。
+11) 【必须自检】输出前验证：每个 scene 的每句 sample_dialogue 都必须能在该 scene 的 video_clip 时间范围内的字幕文本中找到。如果找不到，必须替换为范围内能找到的台词。
 
 字幕原文（SRT 解析结果，包含 start/end/text）：
 {subtitles_json}
