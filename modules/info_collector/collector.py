@@ -104,10 +104,6 @@ class InfoCollector:
             except (ValueError, RuntimeError, requests.RequestException) as error:
                 logger.warning("采集源 %s 执行失败: %s", source, error)
 
-        search_context = self._collect_search_context_by_keywords(movie_name, keywords, year=year)
-        if search_context:
-            merged["search_context"] = search_context
-
         min_scene_count = max(1, int(getattr(conf, "M3_KEYSCENE_MIN", 10)))
         max_scene_count = max(min_scene_count, int(getattr(conf, "M3_KEYSCENE_MAX", 20)))
 
@@ -132,7 +128,7 @@ class InfoCollector:
             min_scene_count=min_scene_count,
             max_scene_count=max_scene_count,
             target_scene_count=target_scene_count,
-            search_context=search_context,
+            search_context=[],
             subtitles=subtitles or [],
         )
 

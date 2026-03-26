@@ -52,8 +52,9 @@ tools/tts_test_from_movie_info.py
 
 # 本地缓存
 cache/
-bgm_library/*.mp3
-bgm_library/*.wav
+tools/
+bgm_library/
+tests/
 
 # 内部文档
 .ai-plans/
