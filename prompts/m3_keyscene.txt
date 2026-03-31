@@ -1,21 +1,53 @@
-任务：生成或修复 movie_info.json（mode={mode}）。
+任务：电影分段整理（mode={mode}）
 
-必须遵守以下规则：
-1) 必须输出严格 JSON，不得输出任何解释文字。
-2) key_scenes 场景数量必须在 {min_scene_count}-{max_scene_count} 之间，并尽量接近 {target_scene_count}。
-3) scene_id 必须从 1 开始连续递增。
-4) video_clip.start/end 必须为 "HH:MM:SS.m" 格式（如 "00:01:35.6"），精确到 0.1 秒。
-5) 场景时间戳必须严格按时间顺序单调递增，后一个场景的 start 必须大于前一个场景的 end。
-6) 场景划分规则：先将电影按时间顺序划分为 N 个连续不重叠的时间段（每个 scene 的 video_clip.start 必须等于上一个 scene 的 video_clip.end 或更晚），再为每个时间段匹配对应的 summary。video_clip.start 必须是该时间段内第一条字幕的实际时间，video_clip.end 必须是最后一条字幕的实际时间。
-7) 禁止直接把字幕均分，必须按实际剧情话题转换点划分场景。
-8) scene 的 summary 必须能体现该时间段内的核心剧情事件。
-9) 【关键约束】sample_dialogue 必须严格从该 scene 的 video_clip 时间范围内的字幕中选取，每句台词的每个字都必须在这个时间范围内出现过。不允许选取范围外的台词！！！
-10) phase 必须为以下之一：setup, inciting_incident, rising_action, midpoint, climax, resolution。
-11) 【必须自检】输出前验证：每个 scene 的每句 sample_dialogue 都必须能在该 scene 的 video_clip 时间范围内的字幕文本中找到。如果找不到，必须替换为范围内能找到的台词。
-12) 每个 scene 的 video_clip 时长建议控制在 8-15 分钟以内，不要出现时长过长或过短的场景。
+请将这部电影细分成连续的片段，尽可能细分，让每个片段都讲述一个完整但不过长的剧情事件。
+
+## 核心要求
+
+1. **尽可能细分** - 把电影切成更多小片段，不要太粗略。建议2小时电影分成15-20个甚至更多场景
+2. **剧情完整** - 每个片段包含一个完整的剧情事件（有起承转合），但不要太长
+3. **时间连续** - 后一片段的start必须大于前一片段的end，场景之间紧密衔接
+4. **基于字幕** - 所有时间戳必须从字幕文件中选取，确保准确对应实际视频
+
+## 切分建议
+
+- **在剧情转折点切分**：冲突、转折、情绪变化、场景切换等
+- **每个场景5-10分钟比较合适**，既不会太长也不会太短
+- **宁可多分几个场景**，也不要把多个剧情事件合并成一个长场景
+- 通读字幕，理解整体剧情结构后再进行切分
+
+## 输出要求
+
+每个片段包含：
+- scene_id：从1开始递增
+- phase：剧情阶段（setup/inciting_incident/rising_action/midpoint/climax/resolution）
+- summary：详细描述该片段的剧情（50字以上）
+- sample_dialogue：6句代表性台词（必须从该时间段字幕中选取）
+- video_clip：start和end时间戳（HH:MM:SS.m格式，必须从字幕中选取）
+
+## 重要提醒
+
+⚠️ **不要生成太少场景**：如果2小时电影只生成6-8个场景，说明分得太粗略了，请继续细分
+⚠️ **时间戳必须递增**：后一场景的start必须严格大于前一场景的end
+⚠️ **基于实际字幕**：所有时间戳必须从提供的字幕文件中选取
+
+## 自检清单
+
+生成后请检查：
+- [ ] 场景数量是否合理？（2小时电影建议15-20个以上）
+- [ ] 时间戳是否严格递增？
+- [ ] 是否覆盖整部电影？
+- [ ] 每个场景是否有完整剧情？
+- [ ] 时间戳是否都来自字幕文件？
+
+{search_context_json}
 
 字幕原文（SRT 解析结果，包含 start/end/text）：
 {subtitles_json}
 
 输出 JSON schema：
 {output_schema_json}
+
+{issues_json}
+
+{draft_json}

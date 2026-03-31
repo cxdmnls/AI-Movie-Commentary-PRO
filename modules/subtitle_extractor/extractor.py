@@ -165,3 +165,21 @@ class SubtitleExtractor:
         with output_file.open("w", encoding="utf-8") as file:
             json.dump(subtitles, file, ensure_ascii=False, indent=2)
         logger.info("字幕已保存: %s", output_file)
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 3:
+        print("用法: python -m modules.subtitle_extractor.extractor <视频文件路径> <输出目录>")
+        sys.exit(1)
+    
+    video_path = sys.argv[1]
+    workspace_dir = sys.argv[2]
+    
+    extractor = SubtitleExtractor(workspace_dir)
+    subtitles = extractor.extract(video_path)
+    
+    output_path = f"{workspace_dir}/subtitles.json"
+    extractor.save(subtitles, output_path)
+    print(f"字幕提取完成，共 {len(subtitles)} 条")
+    print(f"保存位置: {output_path}")

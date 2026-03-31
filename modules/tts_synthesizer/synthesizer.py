@@ -24,23 +24,20 @@ class TTSSynthesizer:
         self.model: Any | None = None
         self._model_error: Exception | None = None
 
-        # Workaround for duplicated OpenMP runtime on Windows envs.
         os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-        # Prefer local cloned CosyVoice repo if available.
         local_cosyvoice_repo = Path(r"E:\Develop\third_party\CosyVoice")
         if local_cosyvoice_repo.exists() and str(local_cosyvoice_repo) not in sys.path:
             sys.path.insert(0, str(local_cosyvoice_repo))
 
-        # Ensure Matcha-TTS submodule is importable without editable install.
         local_matcha_repo = local_cosyvoice_repo / "third_party" / "Matcha-TTS"
         if local_matcha_repo.exists() and str(local_matcha_repo) not in sys.path:
             sys.path.insert(0, str(local_matcha_repo))
 
         try:
-            from cosyvoice.cli.cosyvoice import CosyVoice, CosyVoice2  # type: ignore
-            import cosyvoice.cli.frontend as cosy_frontend  # type: ignore
-            import cosyvoice.utils.file_utils as cosy_file_utils  # type: ignore
+            from cosyvoice.cli.cosyvoice import CosyVoice, CosyVoice2
+            import cosyvoice.cli.frontend as cosy_frontend
+            import cosyvoice.utils.file_utils as cosy_file_utils
         except ImportError as exc:
             self._model_error = exc
             logger.warning(
@@ -48,13 +45,10 @@ class TTSSynthesizer:
             )
             return
 
-        # Work around torchaudio.load -> torchcodec dependency issues on Windows.
-        # CosyVoice frontend imports `load_wav` from file_utils at module import time,
-        # so we patch both references here.
         try:
-            import librosa  # type: ignore
+            import librosa
             import numpy as np
-            import soundfile as sf  # type: ignore
+            import soundfile as sf
             import torch
 
             def _safe_load_wav(wav: str, target_sr: int, min_sr: int = 16000):
@@ -73,7 +67,7 @@ class TTSSynthesizer:
 
             cosy_file_utils.load_wav = _safe_load_wav
             cosy_frontend.load_wav = _safe_load_wav
-        except Exception as exc:  # pragma: no cover - best effort fallback
+        except Exception as exc:
             logger.warning("替换 CosyVoice load_wav 失败，继续使用默认实现: %s", exc)
 
         model_path = Path(conf.COSYVOICE_MODEL_PATH)
@@ -82,8 +76,6 @@ class TTSSynthesizer:
 
         logger.info("加载 CosyVoice 模型: path=%s, device=%s", model_path, conf.TTS_DEVICE)
         try:
-            # CosyVoice 官方接口会自动依据 torch.cuda.is_available() 选择设备。
-            # 若目录是 CosyVoice2 模型，优先使用 CosyVoice2 初始化。
             if (model_path / "cosyvoice2.yaml").exists():
                 self.model = CosyVoice2(str(model_path))
             else:
@@ -242,7 +234,6 @@ class TTSSynthesizer:
         if isinstance(duration, (int, float)) and duration > 0:
             return float(duration)
 
-        # 优先从 video_clip 子结构读取
         video_clip = segment.get("video_clip")
         if isinstance(video_clip, dict):
             clip_start = video_clip.get("start")
@@ -250,7 +241,6 @@ class TTSSynthesizer:
             if isinstance(clip_start, (int, float)) and isinstance(clip_end, (int, float)) and clip_end > clip_start:
                 return float(clip_end - clip_start)
 
-        # 兼容扁平结构
         start = segment.get("start")
         end = segment.get("end")
         if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end > start:
@@ -288,9 +278,8 @@ class TTSSynthesizer:
 
         tensor = tensor.cpu()
 
-        # Prefer soundfile to avoid torchaudio's torchcodec runtime requirement.
         try:
-            import soundfile as sf  # type: ignore
+            import soundfile as sf
 
             np_audio = tensor.squeeze(0).numpy()
             sf.write(str(output_path), np_audio, conf.TTS_SAMPLE_RATE)
@@ -299,7 +288,7 @@ class TTSSynthesizer:
             pass
 
         try:
-            import torchaudio  # type: ignore
+            import torchaudio
 
             torchaudio.save(str(output_path), tensor, conf.TTS_SAMPLE_RATE)
         except Exception as exc:
@@ -350,3 +339,20 @@ class TTSSynthesizer:
                 if nested is not None:
                     return nested
         return None
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 4:
+        print("用法: python -m modules.tts_synthesizer.synthesizer <文本> <参考音频路径> <输出文件路径>")
+        sys.exit(1)
+    
+    text = sys.argv[1]
+    voice_ref = sys.argv[2]
+    output_path = sys.argv[3]
+    
+    synthesizer = TTSSynthesizer()
+    result = synthesizer.synthesize(text, voice_ref, output_path)
+    
+    print(f"TTS 合成完成")
+    print(f"输出文件: {result}")

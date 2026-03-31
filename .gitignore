@@ -23,7 +23,6 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
-tests/
 
 # 项目特定
 workspace/
@@ -46,20 +45,10 @@ Thumbs.db
 # 本地配置（包含密钥）
 conf.py
 
-# 开发调试工具
-tools/run_movie_info_short_video_test.py
-tools/tts_test_from_movie_info.py
-
 # 本地缓存
-cache/
-tools/
 bgm_library/
-tests/
 
 # 内部文档
 .ai-plans/
 SETUP_TTS.md
 environment.movie310.yml
-
-# 临时脚本
-scripts/
