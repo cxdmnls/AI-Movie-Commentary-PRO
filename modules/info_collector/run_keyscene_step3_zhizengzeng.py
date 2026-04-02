@@ -18,9 +18,9 @@ from urllib.parse import quote
 import requests
 from bs4 import BeautifulSoup
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
-conf = importlib.import_module("conf")
+import conf
 
 ZHIZENGZENG_API_KEY = conf.M3_LLM_API_KEY
 ZHIZENGZENG_BASE_URL = conf.M3_LLM_BASE_URL
